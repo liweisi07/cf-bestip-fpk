@@ -6,9 +6,9 @@
 
 ## 域名版（新增）
 
-注：1.0.1 版修复了图标格式问题（改为 RGBA），解决应用中心“应用包不符合系统要求”安装被拒；请用 1.0.1 的包，不要再装 1.0.0。
+注：1.0.1 版修复了图标格式问题（改为 RGBA），解决应用中心“应用包不符合系统要求”安装被拒；请用 1.0.2 的包，不要再装 1.0.0/1.0.1。
 
-另外还有一个域名版：`cf-bestip-domain-1.0.1-arm64.fpk`（ARM64 专用，
+另外还有一个域名版：`cf-bestip-domain-1.0.2-arm64.fpk`（ARM64 专用，
 默认端口 18089，可与 IP 版同时安装，互不干扰）。
 
 - 节点地址不再写每次变化的最优 IP，而是写一个固定不变的域名
@@ -68,7 +68,7 @@
 ## 安装（飞牛应用中心手动安装）
 
 1. 在飞牛桌面打开**应用中心 → 设置 → 手动安装应用**，选择
-   `cf-bestip-1.0.1-arm64.fpk`（ARM64 设备专用，不要装到 x86 设备上）。
+   `cf-bestip-1.0.2-arm64.fpk`（ARM64 设备专用，不要装到 x86 设备上）。
 2. 安装向导里填服务端口（默认 `18088`，确保未被占用）和测速间隔
    （默认 `7` 天），完成安装，等应用中心显示“运行中”。
 3. 在局域网内打开 `http://<NAS-IP>:18088`（或点应用图标），进入设置页。
@@ -122,7 +122,7 @@
   `config/`（权限与资源声明）、`wizard/`（安装/设置向导）、
   `manifest`、`ICON.PNG`、`ICON_256.PNG`。
 - 构建：`python3 scripts/build_fpk.py`，产物在 `dist/`；
-  校验：`python3 scripts/verify_fpk.py dist/cf-bestip-1.0.1-arm64.fpk`。
+  校验：`python3 scripts/verify_fpk.py dist/cf-bestip-1.0.2-arm64.fpk`。
 - 测试：`python3 -m unittest discover -s tests`（改写逻辑、测速结果
   解析、服务端全流程）。
 - 打包格式依据：飞牛 fnOS 官方开发者文档的 .fpk 契约（manifest、
