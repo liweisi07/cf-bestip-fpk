@@ -268,6 +268,9 @@ class AuthHttpTest(unittest.TestCase):
         self.assertIn('name="new_username"', body)
         self.assertIn("账号设置", body)
         self.assertNotIn('id="password"', body)
+        # On a phone the panel becomes a full-width sheet pinned near
+        # the top, so the username/password form is not squeezed.
+        self.assertIn(".settings .panel{position:fixed", body)
 
     def test_logout(self):
         self._login()

@@ -60,7 +60,7 @@ import cfst as cfst_mod
 import cfdns
 import rewriter
 
-VERSION = "1.0.18"
+VERSION = "1.0.19"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PORT = 18089
 DEFAULT_INTERVAL_DAYS = 7
@@ -1128,6 +1128,11 @@ button{padding:10px 16px;font-size:16px}
 input[type=text],input[type=password],input[type=number]{font-size:16px;padding:8px}
 .kv{display:block}.kv:not(:last-child)::after{content:none}
 pre{font-size:13px}
+/* Account settings panel: on a phone it becomes a full-width sheet
+   pinned near the top of the screen, so the username/password form
+   is not squeezed into a narrow dropdown anchored to the button. */
+.settings .panel{position:fixed;top:12px;left:12px;right:12px;width:auto;max-width:none;max-height:calc(100vh - 24px);overflow-y:auto}
+.settings .panel input[type=text],.settings .panel input[type=password]{max-width:none}
 }
 """
 
