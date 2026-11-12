@@ -1,0 +1,7 @@
+#!/bin/sh
+# Runs after the user changes settings (e.g. the wizard port).
+# Restart so the new values take effect. Idempotent.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+"$SCRIPT_DIR/main" stop 2>/dev/null
+"$SCRIPT_DIR/main" start
+exit $?

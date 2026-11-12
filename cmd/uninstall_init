@@ -1,0 +1,6 @@
+#!/bin/sh
+# Runs before uninstall: stop the service. User data is never deleted
+# here; the app center applies the user's keep/delete choice itself.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+"$SCRIPT_DIR/main" stop 2>/dev/null
+exit 0

@@ -1,0 +1,15 @@
+# Build outputs
+dist/
+stage/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Bundled cfst binary (7.5 MB): the app downloads it automatically on
+# first run when the bundled binary is missing, so it is not stored
+# in git. The vendor tarball is the distribution source.
+app/cfst
+
+# Runtime data (created on the NAS at first run)
+data/

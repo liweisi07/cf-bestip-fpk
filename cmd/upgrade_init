@@ -1,0 +1,4 @@
+#!/bin/sh
+# Pre-upgrade step: nothing to back up specially; the service data lives in
+# the preserved data directory and is kept across upgrades by the system.
+exit 0

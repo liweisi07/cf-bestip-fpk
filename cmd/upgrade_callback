@@ -1,0 +1,11 @@
+#!/bin/sh
+# Runs after an upgrade. Drops a stale PID file if one survived the
+# upgrade (the app center normally stops the app first). Idempotent.
+DATA_DIR="${CFBESTIPD_DATA_DIR:-${TRIM_PKGVAR:-}}"
+if [ -n "$DATA_DIR" ] && [ -f "$DATA_DIR/cf-bestipd.pid" ]; then
+    pid=$(cat "$DATA_DIR/cf-bestipd.pid" 2>/dev/null)
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$DATA_DIR/cf-bestipd.pid"
+    fi
+fi
+exit 0

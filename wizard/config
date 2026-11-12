@@ -1,0 +1,1 @@
+[{"items":[{"description":"修改后应用会自动重启并使用新端口。桌面图标默认打开 18089 端口；如果改了端口，请直接用 http://NAS-IP:新端口 打开设置页。","field":"wizard_port","label":"服务端口","rules":[{"message":"请填写端口","required":true},{"message":"端口只能是数字","pattern":"^[0-9]+$"}],"type":"text"}],"stepTitle":"服务端口"}]

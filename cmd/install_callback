@@ -1,0 +1,23 @@
+#!/bin/sh
+# Runs after the app files are installed. Idempotent.
+# Creates the persistent data directory and makes the bundled speed-test
+# binary executable (best effort: the tar already stores the +x bit, and
+# app.py retries chmod at startup).
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if [ -n "$TRIM_APPDEST" ]; then
+    APPDEST="$TRIM_APPDEST"
+elif [ -f "$SCRIPT_DIR/../target/app.py" ]; then
+    APPDEST="$SCRIPT_DIR/../target"
+elif [ -f "$SCRIPT_DIR/../app/app.py" ]; then
+    APPDEST="$SCRIPT_DIR/../app"
+else
+    APPDEST="$SCRIPT_DIR/.."
+fi
+
+DATA_DIR="${CFBESTIPD_DATA_DIR:-${TRIM_PKGVAR:-$APPDEST/data}}"
+mkdir -p "$DATA_DIR" 2>/dev/null
+if [ -f "$APPDEST/cfst" ]; then
+    chmod +x "$APPDEST/cfst" 2>/dev/null
+fi
+exit 0

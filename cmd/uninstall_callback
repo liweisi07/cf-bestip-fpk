@@ -1,0 +1,6 @@
+#!/bin/sh
+# Post-uninstall cleanup: drop a stale PID file so a later reinstall does
+# not mistake a dead PID for a running service. User data (subscriptions,
+# speed-test results) stays in the preserved data directory on purpose.
+rm -f "${TRIM_PKGVAR}/cf-bestipd.pid"
+exit 0

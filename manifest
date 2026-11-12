@@ -1,0 +1,13 @@
+appname=cfbestipd
+version=1.0.17
+display_name=CF优选IP（域名版）
+desc=定时测出最优 Cloudflare IP，自动把自定义域名的 DNS 记录（仅 DNS 解析，不开代理）指向最优 IP；订阅里走 CF 的节点地址写成该域名，客户端更新订阅或等 DNS 生效即拿到优选 IP。订阅与令牌配置只存在本机，不向第三方发送你的数据。
+source=thirdparty
+platform=arm
+maintainer=cf-bestipd
+desktop_uidir=ui
+desktop_applaunchname=cfbestipd.main
+service_port=18089
+checkport=true
+ctl_stop=true
+changelog=设置页加账号密码登录，登录后可在设置页修改密码；图标换成 globe + 闪电的新设计。

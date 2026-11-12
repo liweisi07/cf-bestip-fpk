@@ -1,0 +1,96 @@
+#!/bin/sh
+# cf-bestip lifecycle: main start | stop | status
+# Exit codes (fnOS contract): start/stop 0 ok, 1 failed;
+# status 0 running, 3 not running, 1 unknown action.
+# The app itself never depends on system cron: scheduling lives inside
+# app.py. Data lives in TRIM_PKGVAR (persistent) when provided.
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if [ -n "$TRIM_APPDEST" ]; then
+    APPDEST="$TRIM_APPDEST"
+elif [ -f "$SCRIPT_DIR/../target/app.py" ]; then
+    APPDEST="$SCRIPT_DIR/../target"
+elif [ -f "$SCRIPT_DIR/../app/app.py" ]; then
+    APPDEST="$SCRIPT_DIR/../app"
+else
+    APPDEST="$SCRIPT_DIR/.."
+fi
+
+DATA_DIR="${CFBESTIPD_DATA_DIR:-${TRIM_PKGVAR:-$APPDEST/data}}"
+PIDFILE="$DATA_DIR/cf-bestipd.pid"
+LOGFILE="$DATA_DIR/app.log"
+PORT="${wizard_port:-${TRIM_SERVICE_PORT:-18089}}"
+
+pid_alive() {
+    [ -n "$1" ] && kill -0 "$1" 2>/dev/null
+}
+
+find_python() {
+    for p in python3 /var/apps/python312/target/bin/python3; do
+        if command -v "$p" >/dev/null 2>&1; then
+            echo "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+fail() {
+    msg="$1"
+    if [ -n "$TRIM_TEMP_LOGFILE" ]; then
+        echo "cf-bestipd: $msg" >> "$TRIM_TEMP_LOGFILE" 2>/dev/null
+    fi
+    echo "cf-bestipd: $msg" >&2
+    exit 1
+}
+
+case "$1" in
+    start)
+        if [ -f "$PIDFILE" ]; then
+            old=$(cat "$PIDFILE" 2>/dev/null)
+            if pid_alive "$old"; then
+                exit 0
+            fi
+            rm -f "$PIDFILE"
+        fi
+        PY=$(find_python) || fail "未找到 python3，请先在应用中心安装 Python 工具后再启动"
+        mkdir -p "$DATA_DIR" || fail "无法创建数据目录 $DATA_DIR"
+        CFBESTIPD_DATA_DIR="$DATA_DIR" CFBESTIPD_PORT="$PORT" \
+            TRIM_APPDEST="$APPDEST" nohup "$PY" "$APPDEST/app.py" \
+            >>"$LOGFILE" 2>&1 &
+        echo $! > "$PIDFILE"
+        sleep 2
+        if pid_alive "$(cat "$PIDFILE" 2>/dev/null)"; then
+            exit 0
+        fi
+        rm -f "$PIDFILE"
+        fail "服务启动后立即退出，请查看 $LOGFILE"
+        ;;
+    stop)
+        if [ -f "$PIDFILE" ]; then
+            pid=$(cat "$PIDFILE" 2>/dev/null)
+            if pid_alive "$pid"; then
+                kill "$pid" 2>/dev/null
+                sleep 2
+                if pid_alive "$pid"; then
+                    kill -9 "$pid" 2>/dev/null
+                fi
+            fi
+            rm -f "$PIDFILE"
+        fi
+        exit 0
+        ;;
+    status)
+        if [ -f "$PIDFILE" ]; then
+            pid=$(cat "$PIDFILE" 2>/dev/null)
+            if pid_alive "$pid"; then
+                exit 0
+            fi
+        fi
+        exit 3
+        ;;
+    *)
+        exit 1
+        ;;
+esac

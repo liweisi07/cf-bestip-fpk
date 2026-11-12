@@ -1,0 +1,12 @@
+#!/bin/sh
+# Install-time precheck: the app backend is pure Python 3 stdlib, but the
+# NAS must provide a python3 interpreter (either on PATH or via the
+# Feiniu python312 runtime app, same two locations cmd/main searches).
+if command -v python3 >/dev/null 2>&1; then
+    exit 0
+fi
+if [ -x /var/apps/python312/target/bin/python3 ]; then
+    exit 0
+fi
+echo "需要先在飞牛应用中心安装 Python，才能安装本应用。" > "${TRIM_TEMP_LOGFILE}"
+exit 1
