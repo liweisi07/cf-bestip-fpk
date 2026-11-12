@@ -162,7 +162,7 @@ def main():
         page = curl("POST", "/login", {
             "username": "admin", "password": "admin", "next": "/"})
         check("B1 default admin/admin logs in",
-              "修改密码" in page and "退出登录" in page,
+              "账号设置" in page and "退出登录" in page,
               "(settings page not reached)")
         check("B2 authed /api/status is 200",
               curl_status("GET", "/api/status") == 200)
@@ -196,7 +196,7 @@ def main():
               "账号或密码错误" in page)
         page = curl("POST", "/login", {
             "username": "admin", "password": "newpass1", "next": "/"})
-        check("C6 new password logs in", "修改密码" in page)
+        check("C6 new password logs in", "账号设置" in page)
         COOKIE_JAR = old_jar
 
         # ---- Phase D: logout -----------------------------------------

@@ -172,7 +172,8 @@ class AuthHttpTest(unittest.TestCase):
         self.assertIn("HttpOnly", headers.get("Set-Cookie", ""))
         status, _, body = self._req("GET", "/")
         self.assertEqual(status, 200)
-        self.assertIn("修改密码", body)
+        self.assertIn("⚙ 设置", body)
+        self.assertIn("账号设置", body)
         self.assertIn("退出登录", body)
         status, _, body = self._req("GET", "/api/status")
         self.assertEqual(status, 200)
@@ -214,6 +215,59 @@ class AuthHttpTest(unittest.TestCase):
             "/login", {"username": "admin", "password": "newpass1",
                        "next": "/"}, opener=fresh)
         self.assertEqual(headers["Location"], "/")
+
+    def test_change_username_flow(self):
+        self._login()
+        # Invalid username (space) is rejected.
+        status, headers, _ = self._post("/api/password", {
+            "current_password": "admin", "new_username": "bad name",
+            "new_password": "", "confirm_password": ""})
+        _, _, body = self._req("GET", headers["Location"])
+        self.assertIn("新账号无效", body)
+        # Nothing to change is rejected.
+        status, headers, _ = self._post("/api/password", {
+            "current_password": "admin", "new_username": "",
+            "new_password": "", "confirm_password": ""})
+        _, _, body = self._req("GET", headers["Location"])
+        self.assertIn("账号和密码都没有改", body)
+        # Username only: old name stops working, new name + old
+        # password logs in.
+        status, headers, _ = self._post("/api/password", {
+            "current_password": "admin", "new_username": "kele",
+            "new_password": "", "confirm_password": ""})
+        _, _, body = self._req("GET", headers["Location"])
+        self.assertIn("账号已修改", body)
+        fresh = _opener(http.cookiejar.CookieJar())
+        status, headers, _ = self._post(
+            "/login", {"username": "admin", "password": "admin",
+                       "next": "/"}, opener=fresh)
+        self.assertIn("/login", headers["Location"])
+        status, headers, _ = self._post(
+            "/login", {"username": "kele", "password": "admin",
+                       "next": "/"}, opener=fresh)
+        self.assertEqual(headers["Location"], "/")
+        # Both username and password at once.
+        status, headers, _ = self._post("/api/password", {
+            "current_password": "admin", "new_username": "boss",
+            "new_password": "newpass2", "confirm_password": "newpass2"})
+        _, _, body = self._req("GET", headers["Location"])
+        self.assertIn("账号和密码已修改", body)
+        fresh2 = _opener(http.cookiejar.CookieJar())
+        status, headers, _ = self._post(
+            "/login", {"username": "boss", "password": "newpass2",
+                       "next": "/"}, opener=fresh2)
+        self.assertEqual(headers["Location"], "/")
+
+    def test_settings_button_in_header(self):
+        # The account settings live behind the top-right "设置" button,
+        # not in a card at the bottom of the page.
+        self._login()
+        status, _, body = self._req("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn("⚙ 设置", body)
+        self.assertIn('name="new_username"', body)
+        self.assertIn("账号设置", body)
+        self.assertNotIn('id="password"', body)
 
     def test_logout(self):
         self._login()

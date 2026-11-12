@@ -60,7 +60,7 @@ import cfst as cfst_mod
 import cfdns
 import rewriter
 
-VERSION = "1.0.17"
+VERSION = "1.0.18"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PORT = 18089
 DEFAULT_INTERVAL_DAYS = 7
@@ -1090,6 +1090,14 @@ a{color:#1677ff;text-decoration:none}
 .side .ver{margin-top:12px;padding:10px;border-top:1px solid #f0f0f0;color:#8c8c8c;font-size:12px}
 .main{flex:1;min-width:0}
 .main h1{font-size:22px;margin:0 0 6px}
+.topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.topbar h1{flex:1;min-width:0}
+.settings{position:relative;flex-shrink:0}
+.settings summary{list-style:none;cursor:pointer;padding:8px 16px;border-radius:20px;border:1px solid #d9d9d9;background:#fff;font-size:14px;white-space:nowrap}
+.settings summary::-webkit-details-marker{display:none}
+.settings[open ] summary{background:#f0f7ff;border-color:#1677ff;color:#1677ff}
+.settings .panel{position:absolute;right:0;top:calc(100% + 8px);width:340px;max-width:calc(100vw - 24px);background:#fff;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.15);padding:18px 20px;z-index:10}
+.settings .panel h2{font-size:16px;margin:0 0 12px;padding-bottom:10px;border-bottom:1px solid #f0f0f0}
 .lead{color:#595959;margin:0 0 14px;line-height:1.6}
 .card{background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.08);padding:18px 20px;margin-bottom:16px}
 .card h2{font-size:16px;margin:0 0 12px;padding-bottom:10px;border-bottom:1px solid #f0f0f0}
@@ -1169,7 +1177,7 @@ def login_page(msg="", next_url="/"):
 <main class="main" style="max-width:440px">
 <h1>CF优选IP（域名版）</h1>
 <p class="lead">请登录后使用设置页。默认账号 admin，默认密码 admin，
-首次登录后请在设置页的“修改密码”里改掉。</p>
+首次登录后请点设置页右上角的“⚙ 设置”改掉账号和密码。</p>
 {msg_html}
 <div class="card"><h2>登录</h2>
 <form method="post" action="/login">
@@ -1328,28 +1336,33 @@ def settings_page(msg="", edit_binding=False):
     sidebar = _sidebar([
         ("#overview", "总览"), ("#status", "状态"),
         ("#results", "测速结果"), ("#binding", "域名绑定"),
-        ("#interval", "测速计划"), ("#password", "修改密码"),
+        ("#interval", "测速计划"),
         ("#log", "最近日志"),
         ("/progress", "测速过程"),
     ])
-    # Change-password card: current account, the form, and logout.
-    # The password itself is never shown; only its hash is stored.
-    password_html = (
-        "<div class=\"card\" id=\"password\"><h2>修改密码</h2>"
+    # Account settings live behind the top-right "设置" button: change
+    # the username and/or the password, or log out. The password
+    # itself is never shown; only its hash is stored.
+    settings_html = (
+        "<details class=\"settings\"><summary>⚙ 设置</summary>"
+        "<div class=\"panel\"><h2>账号设置</h2>"
         "<p>当前账号：<b>{username}</b></p>"
         "<form method=\"post\" action=\"/api/password\">"
+        "<p>新账号（留空表示不改）：<br><input type=\"text\" "
+        "name=\"new_username\" autocomplete=\"username\"></p>"
         "<p>当前密码：<br><input type=\"password\" name=\"current_password\" "
         "autocomplete=\"current-password\"></p>"
-        "<p>新密码（至少 {minlen} 位）：<br><input type=\"password\" "
-        "name=\"new_password\" autocomplete=\"new-password\"></p>"
+        "<p>新密码（至少 {minlen} 位，留空表示只改账号）：<br>"
+        "<input type=\"password\" name=\"new_password\" "
+        "autocomplete=\"new-password\"></p>"
         "<p>确认新密码：<br><input type=\"password\" "
         "name=\"confirm_password\" autocomplete=\"new-password\"></p>"
-        "<p><button class=\"primary\" type=\"submit\">修改密码</button></p>"
+        "<p><button class=\"primary\" type=\"submit\">保存</button></p>"
         "</form>"
-        "<p class=\"muted\">改完密码后，其它设备/浏览器上的登录会失效，"
-        "需要用新密码重新登录；当前这个浏览器保持登录。</p>"
+        "<p class=\"muted\">改完后，其它设备/浏览器上的登录会失效，"
+        "需要用新账号密码重新登录；当前这个浏览器保持登录。</p>"
         "<form method=\"post\" action=\"/api/logout\">"
-        "<button type=\"submit\">退出登录</button></form></div>"
+        "<button type=\"submit\">退出登录</button></form></div></details>"
         .format(
             username=html.escape(get_auth()["username"]),
             minlen=MIN_PASSWORD_LEN,
@@ -1372,7 +1385,8 @@ def settings_page(msg="", edit_binding=False):
 <div class="layout">
 {sidebar}
 <main class="main">
-<h1>CF优选IP（域名版）</h1>
+<div class="topbar"><h1>CF优选IP（域名版）</h1>
+{settings_html}</div>
 <p class="lead">定时测出最优 Cloudflare IP，自动把下面绑定的域名记录指向最优 IP；
 订阅里走 CF 的节点地址统一写成该域名。IP 再变也不用客户端重新拉订阅，
 等 DNS 生效（TTL 60 秒）就自动连到新 IP。</p>
@@ -1432,7 +1446,6 @@ placeholder="{token_hint}"></p>
 <p><button class="primary" type="submit">保存</button></p>
 </form></div>
 {toggle_script}
-{password_html}
 <div class="card" id="log"><h2>最近日志</h2>
 <pre>{log}</pre>
 <p class="muted">这里只记关键事件（测速完成、DNS 更新、绑定变更等），详细测速过程请看“测速过程”页。</p></div>
@@ -1474,7 +1487,7 @@ placeholder="{token_hint}"></p>
         schedule_time=_fmt_schedule_time(schedule_hour, schedule_minute),
         region_options=region_options,
         toggle_script=TOGGLE_MODE_SCRIPT,
-        password_html=password_html,
+        settings_html=settings_html,
         log=html.escape(cfg.get("event_log") or "暂无"),
     )
 
@@ -1799,22 +1812,53 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect_login()
                 return
             current = form.get("current_password") or ""
+            new_user = (form.get("new_username") or "").strip()
             new = form.get("new_password") or ""
             confirm = form.get("confirm_password") or ""
             if not verify_login(user, current):
                 self._redirect("当前密码不对")
                 return
-            if len(new) < MIN_PASSWORD_LEN:
-                self._redirect("新密码至少 %d 位" % MIN_PASSWORD_LEN)
+            if new_user and not re.match(
+                    r"^[A-Za-z0-9_.\-]{1,32}$", new_user):
+                self._redirect("新账号无效：只允许字母、数字、下划线、点、短横线，1-32 位")
                 return
-            if new != confirm:
-                self._redirect("两次输入的新密码不一致")
+            if not new_user and not new:
+                self._redirect("账号和密码都没有改")
                 return
-            set_auth(user, new)
+            if new:
+                if len(new) < MIN_PASSWORD_LEN:
+                    self._redirect("新密码至少 %d 位" % MIN_PASSWORD_LEN)
+                    return
+                if new != confirm:
+                    self._redirect("两次输入的新密码不一致")
+                    return
+            # Keep the unchanged half: empty new username keeps the old
+            # name, empty new password keeps the old password.
+            final_user = new_user or user
+            final_pass = new or current
+            set_auth(final_user, final_pass)
+            if final_user != user:
+                # The session stores the old name; refresh it so the
+                # current browser keeps working under the new name.
+                # (load_sessions() is void; _sessions is the global
+                # dict, guarded by _sessions_lock.)
+                _tok = self._session_token()
+                _changed = False
+                with _sessions_lock:
+                    if _tok in _sessions:
+                        _sessions[_tok]["username"] = final_user
+                        _changed = True
+                if _changed:
+                    save_sessions()
             # Keep this browser logged in; other sessions must log in
-            # again with the new password.
+            # again with the new credentials.
             destroy_other_sessions(self._session_token())
-            self._redirect("密码已修改")
+            if new_user and new:
+                self._redirect("账号和密码已修改")
+            elif new_user:
+                self._redirect("账号已修改")
+            else:
+                self._redirect("密码已修改")
             return
         # Every other management API requires a login. The public
         # subscription links (/sub/<name>) are GET-only and stay open.
