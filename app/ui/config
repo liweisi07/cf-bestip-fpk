@@ -1,1 +1,1 @@
-{".url":{"cfbestipd.main":{"allUsers":true,"icon":"images/icon_{0}.png","port":"18089","protocol":"http","title":"CF优选IP（域名版）","type":"url","url":"https://cfip.lolivx.com:56789"}}}
+{".url":{"cfbestipd.main":{"allUsers":true,"icon":"images/icon_{0}.png","port":"18089","protocol":"http","title":"CF优选IP（域名版）","type":"iframe","url":"/"}}}

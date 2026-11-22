@@ -1,5 +1,5 @@
 appname=cfbestipd
-version=1.0.21
+version=1.0.20
 display_name=CF优选IP（域名版）
 desc=定时测出最优 Cloudflare IP，自动把自定义域名的 DNS 记录（仅 DNS 解析，不开代理）指向最优 IP；订阅里走 CF 的节点地址写成该域名，客户端更新订阅或等 DNS 生效即拿到优选 IP。订阅与令牌配置只存在本机，不向第三方发送你的数据。
 source=thirdparty
@@ -13,4 +13,4 @@ desktop_applaunchname=cfbestipd.main
 service_port=18089
 checkport=true
 ctl_stop=true
-changelog=桌面入口改成直跳：点图标直接打开 https://cfip.lolivx.com:56789（经 Lucky 反代），不再嵌 iframe；内网外网都能开。
+changelog=开发者改为可乐冰，点开发者可打开博客；发布者同步改为可乐冰。
