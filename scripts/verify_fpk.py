@@ -8,11 +8,12 @@ Checks (each printed PASS/FAIL):
   3. The manifest's checksum line equals the MD5 of the app.tgz
      member bytes (this is fnpack's mechanism; there is no separate
      manifest.checksum member in fnpack output).
-  4. manifest parses and declares appname / version / platform=arm /
+  4. manifest parses and declares appname / version / platform=all /
      service_port.
   5. Inner app.tgz members are the app/ contents (no app/ prefix) and
      include all app files.
-  6. The bundled cfst member is an AArch64 ELF binary.
+  6. Both bundled cfst members are the right arch: cfst is AArch64
+     ELF, cfst-amd64 is x86-64 ELF (dual-arch package).
   7. All Python files in app.tgz compile.
   8. All JSON files in the package parse.
 """
@@ -36,11 +37,14 @@ REQUIRED_OUTER = {
 }
 
 REQUIRED_INNER = {
-    "app.py", "rewriter.py", "cfdns.py", "cfst.py", "cf_ranges.txt", "ip.txt", "cfst",
+    "app.py", "rewriter.py", "cfdns.py", "cfst.py", "notify.py",
+    "upgrade.py", "cf_ranges.txt", "ip.txt", "ip6.txt",
+    "cfst", "cfst-amd64",
     "ui/config", "ui/images/icon_64.png", "ui/images/icon_256.png",
 }
 
 EM_AARCH64 = 183
+EM_X86_64 = 62
 
 
 def check(label, ok, detail=""):
@@ -90,7 +94,7 @@ def main():
     )
     all_ok &= check(
         "manifest fields",
-        manifest.get("platform") == "arm"
+        manifest.get("platform") == "all"
         and manifest.get("service_port") == "18089"
         and manifest.get("appname") == "cfbestipd"
         and manifest.get("source") == "thirdparty",
@@ -104,20 +108,22 @@ def main():
         and not any(n.startswith("app/") for n in inner_names),
         "missing: %s" % sorted(REQUIRED_INNER - set(inner_names)),
     )
-    cfst_blob = None
-    for m in inner.getmembers():
-        if m.name == "cfst":
-            cfst_blob = inner.extractfile(m).read()
-    elf_ok = False
-    if cfst_blob and len(cfst_blob) > 20:
+    def _elf_machine(blob):
+        if not blob or len(blob) <= 20:
+            return None
         import struct
-        machine = struct.unpack("<H", cfst_blob[18:20])[0]
-        elf_ok = (
-            cfst_blob[:4] == b"\x7fELF"
-            and cfst_blob[4] == 2
-            and machine == EM_AARCH64
-        )
-    all_ok &= check("bundled cfst is AArch64 ELF", elf_ok)
+        if blob[:4] != b"\x7fELF" or blob[4] != 2:
+            return None
+        return struct.unpack("<H", blob[18:20])[0]
+
+    cfst_blobs = {}
+    for m in inner.getmembers():
+        if m.name in ("cfst", "cfst-amd64"):
+            cfst_blobs[m.name] = inner.extractfile(m).read()
+    arm_ok = _elf_machine(cfst_blobs.get("cfst")) == EM_AARCH64
+    amd_ok = _elf_machine(cfst_blobs.get("cfst-amd64")) == EM_X86_64
+    all_ok &= check("bundled cfst is AArch64 ELF", arm_ok)
+    all_ok &= check("bundled cfst-amd64 is x86-64 ELF", amd_ok)
     py_ok = True
     for m in inner.getmembers():
         if m.name.endswith(".py"):

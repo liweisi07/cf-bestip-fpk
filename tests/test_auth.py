@@ -272,6 +272,38 @@ class AuthHttpTest(unittest.TestCase):
         # the top, so the username/password form is not squeezed.
         self.assertIn(".settings .panel{position:fixed", body)
 
+    def test_settings_tabs(self):
+        # Settings redesign: notification settings and online upgrade
+        # live as tabs inside the "⚙ 设置" dropdown, not as cards
+        # further down the page; the sidebar has no links to them.
+        self._login()
+        # Seed an available update so the download form renders too.
+        app._config["update_check"] = {
+            "available": True, "latest": "1.0.23",
+            "changelog": "测试更新", "checked_at": "2026-11-25",
+            "downloaded": ""}
+        status, _, body = self._req("GET", "/")
+        self.assertEqual(status, 200)
+        for label in ("账号密码设置", "通知设置", "检查更新"):
+            self.assertIn(label, body)
+        self.assertIn('data-tab="notify"', body)
+        self.assertIn('data-tab="update"', body)
+        self.assertIn("showSettingsTab(", body)
+        # The tab panels still carry the original forms and actions.
+        self.assertIn('name="notify_tg_chat_id"', body)
+        self.assertIn('action="/api/notify/save"', body)
+        self.assertIn('action="/api/notify/test"', body)
+        self.assertIn('action="/api/update/check"', body)
+        self.assertIn('action="/api/update/download"', body)
+        # No standalone cards or sidebar anchors for them remain.
+        self.assertNotIn('id="notify"', body)
+        self.assertNotIn('id="update"', body)
+        self.assertNotIn('href="#notify"', body)
+        self.assertNotIn('href="#update"', body)
+        # The other sidebar links are untouched.
+        self.assertIn('href="#results"', body)
+        self.assertIn('href="#log"', body)
+
     def test_logout(self):
         self._login()
         status, _, body = self._req("GET", "/")

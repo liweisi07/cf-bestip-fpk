@@ -41,8 +41,10 @@ Notes:
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import os
+import platform
 import re
 import secrets
 import socket
@@ -59,8 +61,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cfst as cfst_mod
 import cfdns
 import rewriter
+import notify as notify_mod
+import upgrade as upgrade_mod
 
-VERSION = "1.0.19"
+VERSION = "1.0.22"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PORT = 18089
 DEFAULT_INTERVAL_DAYS = 7
@@ -73,6 +77,9 @@ MAX_INTERVAL_SECONDS = 30 * 86400
 DEFAULT_SCHEDULE_MODE = "interval"
 DEFAULT_SCHEDULE_TIME = "03:00"
 DEFAULT_REGION = "all"
+# Multi-record DNS (1.0.22): how many top IPs are written as records
+# for one name (1-5, default 5). Same count for A and AAAA.
+DEFAULT_DNS_RECORD_COUNT = 5
 # Login: settings page and management APIs require a session; the
 # subscription links (/sub/<name>) stay public because proxy clients
 # fetch them on their own and cannot log in. Default admin/admin.
@@ -97,10 +104,23 @@ REGION_OPTIONS = (
 )
 MAX_UPSTREAM_BYTES = 10 * 1024 * 1024
 
-CFST_PINNED_URLS = [
-    "https://github.com/XIU2/CloudflareSpeedTest/releases/download/"
-    "v2.3.5/cfst_linux_arm64.tar.gz",
-]
+CFST_PINNED_URLS = {
+    # One .fpk serves both architectures (manifest platform=all):
+    # the package bundles both binaries, and the download fallback
+    # below picks the URL matching the host architecture.
+    "arm64": (
+        "https://github.com/XIU2/CloudflareSpeedTest/releases/download/"
+        "v2.3.5/cfst_linux_arm64.tar.gz"
+    ),
+    "amd64": (
+        "https://github.com/XIU2/CloudflareSpeedTest/releases/download/"
+        "v2.3.5/cfst_linux_amd64.tar.gz"
+    ),
+}
+CFST_ASSET_NAMES = {
+    "arm64": "cfst_linux_arm64.tar.gz",
+    "amd64": "cfst_linux_amd64.tar.gz",
+}
 CFST_API_LATEST = (
     "https://api.github.com/repos/XIU2/CloudflareSpeedTest/releases/latest"
 )
@@ -130,7 +150,19 @@ CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 SESSIONS_PATH = os.path.join(DATA_DIR, "sessions.json")
 OUTPUTS_DIR = os.path.join(DATA_DIR, "outputs")
 CFST_WORKDIR = os.path.join(DATA_DIR, "cfst")
+CFST_WORKDIR6 = os.path.join(DATA_DIR, "cfst6")
 CFST_BIN_DIR = os.path.join(DATA_DIR, "cfst-bin")
+# IPv6 measurement ranges: cfst (v2.1.0+) auto-detects IPv6 from the
+# -f file, so no special flag is needed. The file must NOT be the
+# official ips-v6 list (7 huge /32s: almost every sampled address is
+# unassigned, so barely anything is measurable). The upstream
+# CloudflareSpeedTest repo ships a curated ipv6.txt of the subnets
+# that are actually in use (ASN data from bgp.he.net AS13335); the
+# app bundles that file and refreshes it from the same source.
+IP6_RANGES_URL = (
+    "https://raw.githubusercontent.com/XIU2/CloudflareSpeedTest/master/"
+    "ipv6.txt"
+)
 
 
 def resolve_port():
@@ -186,6 +218,42 @@ _config = {
     "dns_last_update": None,
     "dns_last_error": "",
     "cf_binding_saved": None,
+    # Multi-record DNS (1.0.22): the A record set (top-N IPs).
+    "dns_record_ips": [],
+    "dns_record_count": DEFAULT_DNS_RECORD_COUNT,
+    # IPv6 preference (1.0.22): off by default; the NAS needs an IPv6
+    # route for it to work. IPv6 is measured and updated independently
+    # of IPv4, with its own AAAA record set and the same count.
+    "ipv6_enabled": False,
+    "best_ip6": None,
+    "dns_record_ip6": None,
+    "dns_record_ips6": [],
+    "dns_last_update6": None,
+    "dns_last_error6": "",
+    "last_results6": [],
+    "last_result_count6": 0,
+    "last_region6": None,
+    "last_region_fallback6": False,
+    "cf_ranges6_updated": None,
+    # Notifications (1.0.22). Tokens/secrets live only in this local
+    # config file; no page or API response ever echoes them, and they
+    # never appear in logs. Failure events (no IP / DNS abnormal /
+    # network down) default ON; the two optional event types
+    # (successful IP change, routine speed-test result) default OFF.
+    # notify_state holds incident/dedup bookkeeping (see _notify_*).
+    # update_check holds the last online-upgrade check result.
+    "notify_tg_enabled": False,
+    "notify_tg_token": "",
+    "notify_tg_chat_id": "",
+    "notify_fs_enabled": False,
+    "notify_fs_webhook": "",
+    "notify_fs_secret": "",
+    "notify_proxy": "",
+    "notify_failure": True,
+    "notify_ip_change": False,
+    "notify_daily_result": False,
+    "notify_state": {},
+    "update_check": {},
 }
 _networks = rewriter.default_cf_networks()
 _job_lock = threading.Lock()
@@ -292,6 +360,24 @@ def next_run_text(cfg):
     )
 
 
+def _is_ipv4(ip):
+    """True when `ip` parses as an IPv4 address."""
+    try:
+        return isinstance(ipaddress.ip_address(ip),
+                          ipaddress.IPv4Address)
+    except ValueError:
+        return False
+
+
+def _is_ipv6(ip):
+    """True when `ip` parses as an IPv6 address."""
+    try:
+        return isinstance(ipaddress.ip_address(ip),
+                          ipaddress.IPv6Address)
+    except ValueError:
+        return False
+
+
 def _region(cfg):
     """Region code in effect: 'all' or an IATA colo code."""
     return _normalize_region(cfg.get("region")) or DEFAULT_REGION
@@ -358,6 +444,53 @@ def load_config():
                 if daily is not None and not re.match(
                         r"^\d{4}-\d{2}-\d{2}$", str(daily)):
                     _config["last_daily_run"] = None
+                # Notification settings (1.0.22): old files get
+                # defaults; a hand-edited file may hold garbage.
+                for _key, _default in (
+                        ("notify_tg_enabled", False),
+                        ("notify_fs_enabled", False),
+                        ("notify_failure", True),
+                        ("notify_ip_change", False),
+                        ("notify_daily_result", False)):
+                    if not isinstance(_config.get(_key), bool):
+                        _config[_key] = _default
+                for _key in ("notify_tg_token", "notify_tg_chat_id",
+                             "notify_fs_webhook", "notify_fs_secret",
+                             "notify_proxy"):
+                    if not isinstance(_config.get(_key), str):
+                        _config[_key] = ""
+                if not isinstance(_config.get("notify_state"), dict):
+                    _config["notify_state"] = {}
+                if not isinstance(_config.get("update_check"), dict):
+                    _config["update_check"] = {}
+                # IPv6 + multi-record DNS (1.0.22): old files get
+                # defaults; a hand-edited file may hold garbage.
+                if not isinstance(_config.get("ipv6_enabled"), bool):
+                    _config["ipv6_enabled"] = False
+                try:
+                    _n = int(_config.get("dns_record_count") or 0)
+                except (TypeError, ValueError):
+                    _n = 0
+                _config["dns_record_count"] = (
+                    max(1, min(5, _n)) if _n else
+                    DEFAULT_DNS_RECORD_COUNT)
+                for _key in ("dns_record_ips", "dns_record_ips6",
+                             "last_results6"):
+                    if not isinstance(_config.get(_key), list):
+                        _config[_key] = []
+                for _key in ("best_ip6", "dns_record_ip6",
+                             "dns_last_update6", "last_region6",
+                             "cf_ranges6_updated"):
+                    if (_config.get(_key) is not None
+                            and not isinstance(_config.get(_key), str)):
+                        _config[_key] = None
+                if not isinstance(_config.get("dns_last_error6"), str):
+                    _config["dns_last_error6"] = ""
+                if not isinstance(_config.get("last_result_count6"), int):
+                    _config["last_result_count6"] = 0
+                if not isinstance(_config.get("last_region_fallback6"),
+                                  bool):
+                    _config["last_region_fallback6"] = False
     except (OSError, ValueError):
         pass
     if not _config.get("event_log") and _config.get("last_log"):
@@ -570,41 +703,391 @@ def dns_configured(cfg=None):
     )
 
 
-def update_dns_now(best_ip):
-    """Point the bound record at best_ip. Returns a status message.
+def _dns_record_count(cfg):
+    """How many top IPs are written as DNS records (1-5, default 5)."""
+    try:
+        n = int(cfg.get("dns_record_count") or 0)
+    except (TypeError, ValueError):
+        return DEFAULT_DNS_RECORD_COUNT
+    return max(1, min(5, n)) if n else DEFAULT_DNS_RECORD_COUNT
 
-    Updates the stored DNS state (record IP / last update / last error)
-    and saves the config. Raises nothing: failures are reported as a
-    message and stored, because a stale record IP still works (it is a
-    valid Cloudflare IP, just possibly not the newest best one).
+
+def _top_ips_for_dns(cfg, record_type="A"):
+    """Top-N IPs from the last run's stored rows, for a manual update."""
+    count = _dns_record_count(cfg)
+    rows = (cfg.get("last_results6") if record_type == "AAAA"
+            else cfg.get("last_results")) or []
+    return [r.get("ip") for r in rows[:count] if r.get("ip")]
+
+
+def update_dns_now(ips, record_type="A"):
+    """Point the bound record set at `ips`. Returns a status message.
+
+    `ips` is the top-N list (1-5) for the record type ("A" for IPv4,
+    "AAAA" for IPv6). Updates the stored DNS state (record IPs / last
+    update / last error) and saves the config. Raises nothing:
+    failures are reported as a message and stored, because stale
+    records still work (they are valid Cloudflare IPs, just possibly
+    not the newest best ones). A DNS failure is one of the failure
+    events and notifies (deduped, IPv4 and IPv6 separately); a success
+    closes the incident.
     """
     cfg = get_config_copy()
+    is_v6 = record_type == "AAAA"
+    err_key = "dns_last_error6" if is_v6 else "dns_last_error"
+    ips_key = "dns_record_ips6" if is_v6 else "dns_record_ips"
+    ip_key = "dns_record_ip6" if is_v6 else "dns_record_ip"
+    upd_key = "dns_last_update6" if is_v6 else "dns_last_update"
+    event_key = "dns6" if is_v6 else "dns"
+    label = "AAAA" if is_v6 else "A"
     if not dns_configured(cfg):
         msg = ("未更新 DNS：请先在下方“域名绑定”里填好 API 令牌、域名和"
                "记录名")
         with _config_lock:
-            _config["dns_last_error"] = msg
+            _config[err_key] = msg
+        save_config()
+        return msg
+    if not ips:
+        msg = "未更新 DNS（%s）：没有可用的最优 IP" % label
+        with _config_lock:
+            _config[err_key] = msg
         save_config()
         return msg
     try:
-        record_ip, _ttl, msg = cfdns.ensure_record(
+        written, _ttl, msg = cfdns.ensure_records(
             cfg["cf_token"].strip(),
             cfg["cf_zone"].strip(),
             cfg.get("cf_record") or "",
-            best_ip,
+            list(ips),
+            record_type,
         )
         with _config_lock:
-            _config["dns_record_ip"] = record_ip
-            _config["dns_last_update"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            _config["dns_last_error"] = ""
+            _config[ips_key] = list(written)
+            _config[ip_key] = written[0] if written else None
+            _config[upd_key] = time.strftime("%Y-%m-%d %H:%M:%S")
+            _config[err_key] = ""
         save_config()
+        clear_notify_incident(event_key)
         return msg
     except Exception as exc:  # noqa: BLE001 - shown in UI, token-free
-        msg = "DNS 更新失败：%s" % exc
+        msg = "DNS 更新失败（%s）：%s" % (label, exc)
         with _config_lock:
-            _config["dns_last_error"] = msg
+            _config[err_key] = msg
         save_config()
+        notify_event(event_key, "域名异常", [
+            "域名：%s" % (full_domain() or "未配置"),
+            "记录：%s 记录" % label,
+            "详情：%s" % msg,
+            "请检查 API 令牌权限与域名配置。",
+        ])
         return msg
+
+
+# --------------------------------------------------------------------------
+# Notifications (1.0.22): Telegram + Feishu.
+#
+# Events (only these ever notify):
+#   failure (toggle "notify_failure", default ON):
+#     no_ip   - a speed-test run found no usable/best IPv4
+#     dns     - the bound domain's A record update/check failed
+#     no_ip6  - a speed-test run found no usable/best IPv6
+#     dns6    - the bound domain's AAAA record update/check failed
+#     offline - the NAS lost internet; notified on recovery with
+#               the outage window (it cannot be sent while offline)
+#   optional (each its own toggle, default OFF):
+#     ip_change    - the DNS record IP set changed after a run
+#     daily_result - the summary of a successful speed-test run
+#
+# IPv4 and IPv6 failures are separate incidents (no_ip vs no_ip6,
+# dns vs dns6), so a persistent IPv6 failure never suppresses an
+# IPv4 notification and vice versa.
+#
+# Dedup rule (failure events only; the optional ones are per-run by
+# definition): the same failure notifies once per incident. An
+# incident opens at the first occurrence and closes when its
+# condition clears (a successful run / a successful DNS update).
+# While open, a repeat is counted but not re-sent, except one
+# reminder per 24h while it is still failing. When every channel
+# failed to send, the next attempt waits at least an hour.
+# --------------------------------------------------------------------------
+
+FAILURE_EVENTS = ("no_ip", "dns", "no_ip6", "dns6", "offline")
+# Failure events whose repeats are deduped per incident (offline is
+# notified once per outage on recovery, so it needs no dedup).
+DEDUP_EVENTS = ("no_ip", "dns", "no_ip6", "dns6")
+OPTIONAL_EVENTS = ("ip_change", "daily_result")
+NOTIFY_REMINDER_SECONDS = 24 * 3600
+NOTIFY_RETRY_SECONDS = 3600
+# An outage shorter than this is a blip, not a notified outage.
+MIN_OFFLINE_SECONDS = 60
+
+
+def _notify_enabled(cfg, event_key):
+    """True when this event type is switched on in the settings."""
+    if event_key in FAILURE_EVENTS:
+        return bool(cfg.get("notify_failure", True))
+    if event_key == "ip_change":
+        return bool(cfg.get("notify_ip_change", False))
+    if event_key == "daily_result":
+        return bool(cfg.get("notify_daily_result", False))
+    return False
+
+
+def _notify_channels(cfg):
+    """Enabled + configured channels: list of (kind, sender, kwargs).
+
+    A channel only appears when it is switched on AND its credentials
+    are filled in. The credentials are only ever passed to the sender
+    function; they are never logged or shown on a page.
+    """
+    channels = []
+    if (cfg.get("notify_tg_enabled")
+            and (cfg.get("notify_tg_token") or "").strip()
+            and (cfg.get("notify_tg_chat_id") or "").strip()):
+        channels.append(("telegram", notify_mod.send_telegram, {
+            "token": cfg["notify_tg_token"].strip(),
+            "chat_id": cfg["notify_tg_chat_id"].strip(),
+        }))
+    if (cfg.get("notify_fs_enabled")
+            and (cfg.get("notify_fs_webhook") or "").strip()):
+        channels.append(("feishu", notify_mod.send_feishu, {
+            "webhook_url": cfg["notify_fs_webhook"].strip(),
+            "secret": cfg.get("notify_fs_secret") or "",
+        }))
+    return channels
+
+
+def _notify_text(title, detail_lines, when=None):
+    """Notification body: title, time, then the detail lines."""
+    if when is None:
+        when = time.strftime("%Y-%m-%d %H:%M:%S")
+    lines = ["【CF优选IP】%s" % title, "时间：%s" % when]
+    lines.extend(detail_lines)
+    return "\n".join(lines)
+
+
+def _notify_decision(event_key, state, now):
+    """Dedup decision for a failure occurrence.
+
+    `state` is the stored incident dict for this event key (or {}).
+    Returns (send, new_state); the caller persists new_state.
+    `send` is True on a new incident, on a 24h reminder while the
+    incident is still open, or on an hourly retry after every channel
+    failed last time.
+    """
+    state = dict(state or {})
+    count = int(state.get("count") or 0) + 1
+    last_sent = state.get("last_sent")
+    last_attempt = state.get("last_attempt")
+    if not state:
+        return True, {"since": now, "last_attempt": now,
+                      "last_sent": None, "count": count}
+    if last_sent:
+        if now - last_sent < NOTIFY_REMINDER_SECONDS:
+            state["count"] = count
+            return False, state
+        state["count"] = count
+        state["last_attempt"] = now
+        return True, state
+    if last_attempt and now - last_attempt < NOTIFY_RETRY_SECONDS:
+        state["count"] = count
+        return False, state
+    state["count"] = count
+    state["last_attempt"] = now
+    return True, state
+
+
+def clear_notify_incident(event_key):
+    """Close a failure incident: the next occurrence is a new incident
+    and notifies again."""
+    with _config_lock:
+        state = dict(_config.get("notify_state") or {})
+        if event_key in state:
+            del state[event_key]
+            _config["notify_state"] = state
+            save_config()
+
+
+def notify_event(event_key, title, detail_lines, now=None):
+    """Send a notification for `event_key` when it is enabled (and,
+    for failure events, when the dedup rule allows it).
+
+    The actual sends run in a daemon thread so a slow channel never
+    blocks a run or a settings save; the dedup state is updated
+    synchronously first. Returns a short summary dict. A send failure
+    is also appended to the event log so a broken channel is visible.
+    """
+    if now is None:
+        now = time.time()
+    cfg = get_config_copy()
+    if not _notify_enabled(cfg, event_key):
+        return {"sent": [], "skipped": "该类通知未开启"}
+    channels = _notify_channels(cfg)
+    if not channels:
+        return {"sent": [], "skipped": "未配置通知渠道"}
+    text = _notify_text(title, detail_lines,
+                        time.strftime("%Y-%m-%d %H:%M:%S",
+                                      time.localtime(now)))
+    if event_key in DEDUP_EVENTS:
+        with _config_lock:
+            state = dict((_config.get("notify_state") or {}).get(event_key)
+                         or {})
+            send, new_state = _notify_decision(event_key, state, now)
+            merged = dict(_config.get("notify_state") or {})
+            merged[event_key] = new_state
+            _config["notify_state"] = merged
+            save_config()
+            if not send:
+                return {"sent": [], "skipped": "同一故障已通知过（去重）"}
+    proxy = (cfg.get("notify_proxy") or "").strip() or None
+
+    def _send_all():
+        for kind, sender, kwargs in channels:
+            try:
+                ok, err = sender(text=text, timeout=15, proxy=proxy,
+                                 **kwargs)
+            except Exception as exc:  # noqa: BLE001 - logged, no secret
+                ok, err = False, str(exc)
+            if not ok:
+                label = "Telegram" if kind == "telegram" else "飞书"
+                record_event("通知发送失败（%s）：%s" % (label, err))
+            elif event_key in DEDUP_EVENTS:
+                with _config_lock:
+                    merged = dict(_config.get("notify_state") or {})
+                    st = dict(merged.get(event_key) or {})
+                    st["last_sent"] = now
+                    merged[event_key] = st
+                    _config["notify_state"] = merged
+                save_config()
+
+    threading.Thread(target=_send_all, daemon=True).start()
+    return {"sent": [kind for kind, _s, _kw in channels], "skipped": ""}
+
+
+def check_connectivity(timeout=8):
+    """True when the NAS can reach the internet (direct, no proxy).
+
+    A TCP connect to Cloudflare's 1.1.1.1:443 plus a DNS lookup of
+    api.cloudflare.com; both must work, because every step of a run
+    needs DNS and HTTPS to Cloudflare. Used only to record outages
+    (see note_offline_change); a run is never skipped on its account,
+    so a false negative only costs a log line, never a measurement.
+    """
+    try:
+        sock = socket.create_connection(("1.1.1.1", 443), timeout=timeout)
+        sock.close()
+    except OSError:
+        return False
+    try:
+        socket.getaddrinfo("api.cloudflare.com", 443)
+    except OSError:
+        return False
+    return True
+
+
+def note_offline_change(online, now=None):
+    """Record an outage start, or notify on recovery.
+
+    Called by the scheduler tick (the sole outage detector). While
+    offline nothing can be sent, so the start time is only recorded;
+    when connectivity returns, one notification is sent stating the
+    outage window (from X to Y) and that the network is back. An
+    outage shorter than MIN_OFFLINE_SECONDS is a blip and is not
+    notified.
+    """
+    if now is None:
+        now = time.time()
+    cfg = get_config_copy()
+    since = (cfg.get("notify_state") or {}).get("offline_since")
+    if not online:
+        if not since:
+            with _config_lock:
+                merged = dict(_config.get("notify_state") or {})
+                merged["offline_since"] = now
+                _config["notify_state"] = merged
+            save_config()
+            record_event("网络已断开（已记录断网开始时间，恢复后通知）")
+        return
+    if not since:
+        return
+    with _config_lock:
+        merged = dict(_config.get("notify_state") or {})
+        merged.pop("offline_since", None)
+        _config["notify_state"] = merged
+    save_config()
+    if now - since < MIN_OFFLINE_SECONDS:
+        return
+    window = "%s 至 %s" % (
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since)),
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)))
+    detail = ["断网时段：%s" % window,
+              "网络已恢复，测速与 DNS 更新将按计划继续。",
+              "（断网期间发不出去，恢复后才补发，不是实时送达）"]
+    domain = full_domain(cfg)
+    if domain:
+        detail.insert(0, "域名：%s" % domain)
+    notify_event("offline", "网络已恢复", detail, now=now)
+    record_event("网络已恢复（断网 %s）" % window)
+
+
+# --------------------------------------------------------------------------
+# Online upgrade (1.0.22): check the repo for a newer release and
+# download its .fpk. Nothing is auto-installed: fnOS offers no
+# supported way for an app to trigger its own reinstall, so the user
+# installs the downloaded file from the app center (direct overwrite,
+# config preserved).
+# --------------------------------------------------------------------------
+
+def check_update():
+    """Check the repo for a newer release; store the result in
+    config['update_check'] and return a status message."""
+    try:
+        latest, changelog = upgrade_mod.fetch_latest()
+    except Exception as exc:  # noqa: BLE001 - shown in UI
+        return "检查更新失败：%s" % exc
+    cmp_result = upgrade_mod.compare_versions(VERSION, latest)
+    with _config_lock:
+        stored = dict(_config.get("update_check") or {})
+        stored["latest"] = latest
+        stored["changelog"] = changelog
+        stored["checked_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        stored["available"] = bool(cmp_result is not None
+                                   and cmp_result < 0)
+        _config["update_check"] = stored
+    save_config()
+    if cmp_result is None:
+        return "检查更新失败：仓库版本号无法解析（%s）" % latest
+    if cmp_result < 0:
+        return "发现新版本 %s（当前 %s）：%s" % (
+            latest, VERSION, changelog or "（无更新日志）")
+    return "已是最新版本（当前 %s，仓库最新 %s）" % (VERSION, latest)
+
+
+def download_update():
+    """Download the latest .fpk (per the stored check) into the data
+    dir's updates/ folder. Returns a status message with the install
+    guidance. Never auto-installs."""
+    cfg = get_config_copy()
+    stored = cfg.get("update_check") or {}
+    latest = stored.get("latest") or ""
+    if not stored.get("available") or not latest:
+        return "没有可下载的新版本：请先点“检查更新”，确认有新版后再下载"
+    dest_dir = os.path.join(DATA_DIR, "updates")
+    try:
+        path = upgrade_mod.download_fpk(latest, dest_dir)
+    except Exception as exc:  # noqa: BLE001 - shown in UI
+        return "下载失败：%s" % exc
+    with _config_lock:
+        stored2 = dict(_config.get("update_check") or {})
+        stored2["downloaded"] = path
+        stored2["downloaded_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        _config["update_check"] = stored2
+    save_config()
+    record_event("已下载新版 .fpk：%s" % path)
+    return ("已下载新版 %s 到：\n%s\n\n安装方法：去飞牛应用中心 → "
+            "手动安装（本地安装），选择这个 .fpk 文件，直接覆盖安装即可，"
+            "配置会保留。装好后重启应用，版本号会变成 %s。"
+            % (latest, path, latest))
 
 
 def load_networks():
@@ -649,33 +1132,157 @@ def refresh_cf_ranges():
     return True, "已刷新 Cloudflare IP 段（%d 条）" % len(nets)
 
 
+def bundled_ip6_ranges_path():
+    return os.path.join(APP_DIR, "ip6.txt")
+
+
+def data_ip6_ranges_path():
+    return os.path.join(DATA_DIR, "ip6.txt")
+
+
+def ip6_file():
+    """IPv6 measurement file: refreshed copy first, bundled otherwise."""
+    for path in (data_ip6_ranges_path(), bundled_ip6_ranges_path()):
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
+    return bundled_ip6_ranges_path()
+
+
+def _valid_ip6_ranges(text):
+    """True when `text` looks like a list of IPv6 CIDRs."""
+    lines = [ln.strip() for ln in (text or "").splitlines()
+             if ln.strip() and not ln.strip().startswith("#")]
+    if not lines:
+        return False
+    import ipaddress
+    good = 0
+    for line in lines:
+        try:
+            net = ipaddress.ip_network(line, strict=False)
+            if isinstance(net, ipaddress.IPv6Network):
+                good += 1
+        except ValueError:
+            continue
+    return good >= 3 and good >= len(lines) // 2
+
+
+def refresh_ip6_ranges():
+    """Refresh the IPv6 measurement ranges from the upstream repo
+    (the curated ipv6.txt). Falls back to the bundled copy on failure:
+    the bundled file is the same list, so a failed refresh loses
+    nothing but freshness."""
+    req = urllib.request.Request(
+        IP6_RANGES_URL, headers={"User-Agent": "cf-bestipd/%s" % VERSION}
+    )
+    try:
+        with _NO_PROXY_OPENER.open(req, timeout=15) as resp:
+            text = resp.read().decode("utf-8", "ignore")
+    except Exception as exc:  # noqa: BLE001 - report, keep old list
+        return False, "刷新失败（沿用旧列表）：%s" % exc
+    if not _valid_ip6_ranges(text):
+        return False, "刷新失败：下载到的内容不是有效的 IPv6 段列表，已沿用旧列表"
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        _atomic_write(data_ip6_ranges_path(), text.encode("utf-8"))
+    except OSError as exc:
+        return False, "刷新失败（无法写入）：%s" % exc
+    with _config_lock:
+        _config["cf_ranges6_updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    save_config()
+    count = len([ln for ln in text.splitlines() if ln.strip()])
+    return True, "已刷新 IPv6 段（%d 条）" % count
+
+
+def check_ipv6_connectivity(timeout=5):
+    """True when this host can reach Cloudflare over IPv6.
+
+    A TCP connect to Cloudflare's 2606:4700:4700::1111:443. Used
+    before an IPv6 run: without an IPv6 route the measurement would
+    find nothing, so the run is skipped with a clear log line
+    instead of a noisy 'no IPv6 found' failure.
+    """
+    try:
+        sock = socket.create_connection(
+            ("2606:4700:4700::1111", 443), timeout=timeout)
+        sock.close()
+        return True
+    except OSError:
+        return False
+
+
 # --------------------------------------------------------------------------
-# CloudflareSpeedTest binary
+# CloudflareSpeedTest binary (dual-architecture, 1.0.22)
+#
+# One .fpk serves ARM64 and x86_64 (manifest platform=all). The
+# package bundles both binaries (app/cfst = arm64, app/cfst-amd64 =
+# amd64); the host architecture is detected at runtime and the
+# matching one is used. An unsupported architecture fails loudly
+# here instead of silently running the wrong binary (which would
+# die with an exec-format error deep inside a run).
 # --------------------------------------------------------------------------
 
-def find_cfst_bin():
+def detect_arch():
+    """Return 'arm64' or 'amd64' for this host.
+
+    Raises RuntimeError for anything else: the package only ships
+    those two binaries, and picking one blindly would be wrong.
+    """
+    machine = (platform.machine() or "").strip().lower()
+    if machine in ("aarch64", "arm64"):
+        return "arm64"
+    if machine in ("x86_64", "amd64"):
+        return "amd64"
+    raise RuntimeError(
+        "不支持的设备架构：%s（本应用只支持 ARM64 与 x86_64）"
+        % (machine or "未知"))
+
+
+def _bundled_cfst_path(arch):
+    """Bundled binary for `arch` (arm64 keeps the historic name)."""
+    name = "cfst" if arch == "arm64" else "cfst-amd64"
+    return os.path.join(APP_DIR, name)
+
+
+def find_cfst_bin(arch=None):
+    """Return a usable cfst binary path for `arch`, or None.
+
+    Order: explicit env override (tests / manual), the downloaded
+    binary for this arch, the bundled binary for this arch, then --
+    arm64 only -- the legacy download location from before the
+    dual-arch change (CFST_BIN_DIR/cfst), so existing arm64 installs
+    do not re-download on upgrade.
+    """
+    if arch is None:
+        arch = detect_arch()
     env_path = os.environ.get("CFBESTIPD_CFST_BIN")
     if env_path and os.path.isfile(env_path):
         return env_path
-    bundled = os.path.join(APP_DIR, "cfst")
+    downloaded = os.path.join(CFST_BIN_DIR, "cfst-" + arch)
+    if os.path.isfile(downloaded):
+        return downloaded
+    bundled = _bundled_cfst_path(arch)
     if os.path.isfile(bundled):
         return bundled
-    local = os.path.join(CFST_BIN_DIR, "cfst")
-    if os.path.isfile(local):
-        return local
+    if arch == "arm64":
+        legacy = os.path.join(CFST_BIN_DIR, "cfst")
+        if os.path.isfile(legacy):
+            return legacy
     return None
 
 
-def _download_cfst(dest_path):
-    """Download the official linux_arm64 tarball and extract the binary."""
+def _download_cfst(dest_path, arch=None):
+    """Download the official cfst tarball for `arch` and extract it."""
     import tarfile
 
+    if arch is None:
+        arch = detect_arch()
+    asset = CFST_ASSET_NAMES[arch]
     urls = []
     env_urls = os.environ.get("CFBESTIPD_CFST_URLS", "")
     if env_urls.strip():
         urls = [u.strip() for u in env_urls.split(",") if u.strip()]
     else:
-        urls = list(CFST_PINNED_URLS)
+        urls = [CFST_PINNED_URLS[arch]]
         # Fallback: ask GitHub API for the latest release asset.
         try:
             req = urllib.request.Request(
@@ -685,9 +1292,9 @@ def _download_cfst(dest_path):
             )
             with _NO_PROXY_OPENER.open(req, timeout=20) as resp:
                 rel = json.loads(resp.read().decode("utf-8"))
-            for asset in rel.get("assets", []):
-                if asset.get("name") == "cfst_linux_arm64.tar.gz":
-                    urls.append(asset["browser_download_url"])
+            for item in rel.get("assets", []):
+                if item.get("name") == asset:
+                    urls.append(item["browser_download_url"])
                     break
         except Exception:  # noqa: BLE001 - pinned URL is tried first anyway
             pass
@@ -727,22 +1334,23 @@ def _download_cfst(dest_path):
             continue
     raise RuntimeError(
         "自动下载测速程序失败（%s）。请检查 NAS 能否访问 github.com，"
-        "或手动把 CloudflareSpeedTest 的 linux_arm64 版 cfst 程序放到 %s"
-        % (last_err, dest_path)
+        "或手动把 CloudflareSpeedTest 的 linux_%s 版 cfst 程序放到 %s"
+        % (last_err, arch, dest_path)
     )
 
 
 def ensure_cfst():
     """Return a usable cfst binary path, downloading it on first run."""
-    path = find_cfst_bin()
+    arch = detect_arch()
+    path = find_cfst_bin(arch)
     if path:
         try:
             os.chmod(path, 0o755)
         except OSError:
             pass
         return path
-    dest = os.path.join(CFST_BIN_DIR, "cfst")
-    return _download_cfst(dest)
+    dest = os.path.join(CFST_BIN_DIR, "cfst-" + arch)
+    return _download_cfst(dest, arch)
 
 
 # --------------------------------------------------------------------------
@@ -879,11 +1487,19 @@ def _clean_progress_line(line, phase):
 
 
 def run_job(scheduled=False):
-    """One full cycle: measure best IP, rewrite all subscriptions.
+    """One full cycle: measure best IPs, update DNS, rewrite subs.
 
     `scheduled` means the run was fired by the scheduler (not by the
     "run now" button): only a scheduled run in daily mode counts as
     the day's timed run, so a manual run never skips the 03:00 run.
+
+    IPv4 is the core of the run: if its measurement fails, the run
+    fails. IPv6 (when enabled) is independent and best-effort: a
+    failed IPv6 measurement is logged and notified (no_ip6) but never
+    fails the run, and the IPv4 results are still saved. DNS updates
+    write the top-N IPs of the selected region as a record set
+    (A for IPv4, AAAA for IPv6 when enabled); a DNS failure is not
+    fatal either (stale records still work).
     """
     global _job_running, _job_stage, _job_started
     with _job_lock:
@@ -929,12 +1545,26 @@ def run_job(scheduled=False):
             del live_detail[:-15]
         _publish_live()
 
+    cfg_before = get_config_copy()
+    prev_ips = list(cfg_before.get("dns_record_ips") or [])
+    prev_ips6 = list(cfg_before.get("dns_record_ips6") or [])
+    ipv6_enabled = bool(cfg_before.get("ipv6_enabled"))
+    dns_count = _dns_record_count(cfg_before)
+    # IPv6 results are filled in below when enabled (None = not run).
+    best_ip6 = None
+    top_rows6 = []
+    total_rows6 = 0
+    fell_back6 = False
+    ipv6_ran = False
     try:
         # 1. Refresh CF ranges (best effort, never fatal).
         ok, msg = refresh_cf_ranges()
         log_lines.append("IP 段：" + msg)
         networks = load_networks()
-        # 2. Measure.
+        if ipv6_enabled:
+            ok6, msg6 = refresh_ip6_ranges()
+            log_lines.append("IPv6 段：" + msg6)
+        # 2. Measure IPv4.
         try:
             cfst_bin = ensure_cfst()
         except Exception as exc:  # noqa: BLE001 - shown in UI
@@ -953,6 +1583,13 @@ def run_job(scheduled=False):
                 region=region,
             )
         )
+        # The IPv4 ranges file only holds IPv4; drop anything that is
+        # not a valid IPv4 address so a wrong file never leaks into
+        # DNS or the subscription.
+        top_rows = [r for r in top_rows if _is_ipv4(r.get("ip"))]
+        if not top_rows or not _is_ipv4(best_ip):
+            raise RuntimeError("没有可用的测速结果")
+        best_ip = top_rows[0]["ip"]
         live_detail.clear()
         live_progress = ""
         log_lines.append("测速完成，最优 IP：%s" % best_ip)
@@ -960,14 +1597,64 @@ def run_job(scheduled=False):
             log_lines.append(
                 "区域 %s 未找到可用 IP，已用全局最优" % region)
         _publish_live()
-        # 3. Point the bound domain at the new best IP. A failure here
-        # is not fatal: the record keeps the previous best IP, which
-        # still works, and the subscription output is stable anyway.
+        # 2b. Measure IPv6 (independent, best-effort). Without an
+        # IPv6 route the run is skipped with a clear line instead of
+        # a noisy failure; a real measurement that finds nothing is
+        # a no_ip6 failure event.
+        if ipv6_enabled:
+            if not check_ipv6_connectivity():
+                log_lines.append(
+                    "IPv6 未就绪（本机无 IPv6 出口），跳过本次 IPv6 测速")
+            else:
+                with _job_lock:
+                    _job_stage = "测速中（IPv6）"
+                try:
+                    best_ip6, _log6, top_rows6, total_rows6, fell_back6 = (
+                        cfst_mod.run_speedtest(
+                            cfst_bin, ip6_file(), CFST_WORKDIR6,
+                            on_line=_on_cfst_line, region=region,
+                        )
+                    )
+                    # The IPv6 ranges file only holds IPv6; drop
+                    # anything that is not a valid IPv6 address so a
+                    # wrong file never writes IPv4 into an AAAA record.
+                    top_rows6 = [r for r in top_rows6
+                                 if _is_ipv6(r.get("ip"))]
+                    if not top_rows6 or not _is_ipv6(best_ip6):
+                        raise RuntimeError(
+                            "没有可用的测速结果（未测到 IPv6）")
+                    best_ip6 = top_rows6[0]["ip"]
+                    ipv6_ran = True
+                    live_detail.clear()
+                    live_progress = ""
+                    log_lines.append(
+                        "IPv6 测速完成，最优 IPv6：%s" % best_ip6)
+                    if fell_back6:
+                        log_lines.append(
+                            "区域 %s 未找到可用 IPv6，已用全局最优" % region)
+                except Exception as exc:  # noqa: BLE001 - best-effort
+                    log_lines.append("IPv6 测速失败：%s" % exc)
+                    if "没有可用的测速结果" in str(exc):
+                        notify_event("no_ip6", "测不到 IPv6", [
+                            "域名：%s" % (full_domain() or "未配置"),
+                            "原因：%s" % exc,
+                            "请检查本机 IPv6 网络，或调整优选地区。",
+                        ])
+                _publish_live()
+        # 3. Point the bound domain at the top-N IPs. A failure here
+        # is not fatal: the records keep the previous IPs, which
+        # still work, and the subscription output is stable anyway.
         target = full_domain()
         with _job_lock:
             _job_stage = "更新 DNS"
-        dns_msg = update_dns_now(best_ip)
+        top_ips = [r["ip"] for r in top_rows[:dns_count] if r.get("ip")]
+        dns_msg = update_dns_now(top_ips, "A")
         log_lines.append("DNS：" + dns_msg)
+        if ipv6_ran and dns_configured():
+            top_ips6 = [r["ip"] for r in top_rows6[:dns_count]
+                        if r.get("ip")]
+            dns_msg6 = update_dns_now(top_ips6, "AAAA")
+            log_lines.append("DNS（IPv6）：" + dns_msg6)
         _publish_live()
         # 4. Rewrite every subscription to the bound domain.
         with _job_lock:
@@ -988,6 +1675,8 @@ def run_job(scheduled=False):
                     "订阅 %s 更新失败：%s" % (sub["name"], exc)
                 )
         _publish_live()
+        new_ips = list(get_config_copy().get("dns_record_ips") or [])
+        new_ips6 = list(get_config_copy().get("dns_record_ips6") or [])
         with _config_lock:
             _config["best_ip"] = best_ip
             _config["last_run"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -997,9 +1686,35 @@ def run_job(scheduled=False):
             _config["last_result_count"] = total_rows
             _config["last_region"] = region
             _config["last_region_fallback"] = fell_back
+            if ipv6_ran:
+                _config["best_ip6"] = best_ip6
+                _config["last_results6"] = top_rows6
+                _config["last_result_count6"] = total_rows6
+                _config["last_region6"] = region
+                _config["last_region_fallback6"] = fell_back6
             if scheduled and mode == "daily":
                 _config["last_daily_run"] = time.strftime("%Y-%m-%d")
         save_config()
+        # Optional notifications (off by default, user opts in).
+        # A successful run closes the no-IP incidents.
+        clear_notify_incident("no_ip")
+        if ipv6_ran:
+            clear_notify_incident("no_ip6")
+        if new_ips != prev_ips or (ipv6_ran and new_ips6 != prev_ips6):
+            detail = ["域名：%s" % (target or "未配置")]
+            if new_ips != prev_ips:
+                detail.append("IPv4（A 记录）：%s"
+                              % ("、".join(new_ips) if new_ips else "无"))
+            if ipv6_ran and new_ips6 != prev_ips6:
+                detail.append("IPv6（AAAA 记录）：%s"
+                              % ("、".join(new_ips6) if new_ips6 else "无"))
+            notify_event("ip_change", "成功换 IP", detail)
+        _notify_daily_result(best_ip, top_rows, total_rows, fell_back,
+                             best_ip6 if ipv6_ran else None,
+                             top_rows6 if ipv6_ran else [],
+                             total_rows6 if ipv6_ran else 0,
+                             fell_back6 if ipv6_ran else False,
+                             region, target)
         return "\n".join(log_lines)
     except Exception as exc:  # noqa: BLE001 - shown in UI
         with _config_lock:
@@ -1007,11 +1722,48 @@ def run_job(scheduled=False):
             _config["event_log"] = "\n".join(
                 (log_lines + ["失败：%s" % exc])[-20:])
         save_config()
+        if "没有可用的测速结果" in str(exc):
+            notify_event("no_ip", "测不到 IP", [
+                "域名：%s" % (full_domain() or "未配置"),
+                "原因：%s" % exc,
+                "请检查测速程序与网络，或调整优选地区。",
+            ])
         return _config["last_log"]
     finally:
         with _job_lock:
             _job_running = False
             _job_stage = ""
+
+
+def _notify_daily_result(best_ip, top_rows, total_rows, fell_back,
+                         best_ip6, top_rows6, total_rows6, fell_back6,
+                         region, target):
+    """Routine speed-test summary (optional event, off by default).
+
+    Fires after every successful run when the user switched it on.
+    """
+    if not top_rows:
+        return
+    best = top_rows[0]
+    detail = [
+        "域名：%s" % (target or "未配置"),
+        "最优 IP：%s（延迟 %s ms，丢包率 %s，速度 %s MB/s）"
+        % (best.get("ip", ""), best.get("latency", ""),
+           best.get("loss", ""), best.get("speed", "")),
+        "本次共测出 %d 个可用 IP" % total_rows,
+    ]
+    if fell_back:
+        detail.append("区域 %s 未找到可用 IP，已用全局最优" % region)
+    if best_ip6 and top_rows6:
+        best6 = top_rows6[0]
+        detail.append(
+            "最优 IPv6：%s（延迟 %s ms，丢包率 %s，速度 %s MB/s）"
+            % (best6.get("ip", ""), best6.get("latency", ""),
+               best6.get("loss", ""), best6.get("speed", "")))
+        detail.append("本次共测出 %d 个可用 IPv6" % total_rows6)
+        if fell_back6:
+            detail.append("区域 %s 未找到可用 IPv6，已用全局最优" % region)
+    notify_event("daily_result", "测速结果", detail)
 
 
 def scheduler_loop():
@@ -1025,6 +1777,15 @@ def scheduler_loop():
     while True:
         time.sleep(300)
         try:
+            # Connectivity probe (1.0.22): the sole outage detector.
+            # Records an outage start while offline; on recovery it
+            # sends the outage-window notification. A failed probe
+            # never kills the scheduler. (Runs do not probe: the
+            # measurement itself is the authority there.)
+            try:
+                note_offline_change(check_connectivity())
+            except Exception:  # noqa: BLE001 - probe must never break the tick
+                pass
             cfg = get_config_copy()
             if _schedule_mode(cfg) == "daily":
                 today = time.strftime("%Y-%m-%d")
@@ -1098,6 +1859,13 @@ a{color:#1677ff;text-decoration:none}
 .settings[open ] summary{background:#f0f7ff;border-color:#1677ff;color:#1677ff}
 .settings .panel{position:absolute;right:0;top:calc(100% + 8px);width:340px;max-width:calc(100vw - 24px);background:#fff;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.15);padding:18px 20px;z-index:10}
 .settings .panel h2{font-size:16px;margin:0 0 12px;padding-bottom:10px;border-bottom:1px solid #f0f0f0}
+/* Settings tabs: three functions in one dropdown. Buttons only
+   hide/show panels in place, so half-filled forms keep their input.
+   flex-wrap keeps the three labels on one row on a phone, or wraps
+   them instead of overflowing. */
+.settings .tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.settings .tab{flex:1 1 0;padding:7px 4px;margin:0;font-size:13px;white-space:nowrap;min-width:0}
+.settings .tab.active{background:#1677ff;border-color:#1677ff;color:#fff}
 .lead{color:#595959;margin:0 0 14px;line-height:1.6}
 .card{background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.08);padding:18px 20px;margin-bottom:16px}
 .card h2{font-size:16px;margin:0 0 12px;padding-bottom:10px;border-bottom:1px solid #f0f0f0}
@@ -1148,6 +1916,29 @@ function toggleMode() {
   document.getElementById('daily_box').style.display = daily ? '' : 'none';
 }
 toggleMode();
+</script>
+"""
+
+
+# Tab switching for the settings panel (see settings_html): only
+# hides/shows panels in place, so form input is never lost. Kept as
+# a plain string like TOGGLE_MODE_SCRIPT: the template is rendered
+# with str.format(), which would choke on the braces in JavaScript.
+# Inserted via the {settings_tabs_script} placeholder.
+SETTINGS_TABS_SCRIPT = """
+<script>
+function showSettingsTab(name) {
+  var tabs = ['account', 'notify', 'update'];
+  for (var i = 0; i < tabs.length; i++) {
+    var pane = document.getElementById('tab-' + tabs[i]);
+    if (pane) pane.style.display = tabs[i] === name ? '' : 'none';
+  }
+  var buttons = document.querySelectorAll('.settings .tab');
+  for (var j = 0; j < buttons.length; j++) {
+    buttons[j].classList.toggle('active', buttons[j].getAttribute('data-tab') === name);
+  }
+}
+showSettingsTab('account');
 </script>
 """
 
@@ -1271,6 +2062,64 @@ def settings_page(msg="", edit_binding=False):
                         "</p>" % html.escape(cfg["best_ip"]))
     else:
         results_html = "<p>尚未测速，可点“立即测速并更新”。</p>"
+    # IPv6 results (second table, only when IPv6 is enabled). Same
+    # columns and ranking as IPv4; the region filter applies to both.
+    results6_html = ""
+    if cfg.get("ipv6_enabled"):
+        results6 = cfg.get("last_results6") or []
+        if results6:
+            best6 = results6[0]
+            last_region6 = cfg.get("last_region6") or "all"
+            if last_region6 != "all":
+                if cfg.get("last_region_fallback6"):
+                    region_note6 = ("优选地区 %s 没有可用 IPv6，"
+                                    "已退回全局最优；"
+                                    % _region_label(last_region6))
+                else:
+                    region_note6 = ("优选地区：%s；"
+                                    % _region_label(last_region6))
+            else:
+                region_note6 = ""
+            res_rows6 = []
+            for i, r in enumerate(results6):
+                mark = " ★最优" if i == 0 else ""
+                res_rows6.append(
+                    "<tr><td>{ip}{mark}</td><td>{loss}</td>"
+                    "<td>{lat}</td><td>{speed}</td>"
+                    "<td>{region}</td></tr>".format(
+                        ip=html.escape(str(r.get("ip", ""))),
+                        mark=mark,
+                        loss=html.escape(str(r.get("loss", ""))),
+                        lat=html.escape(str(r.get("latency", ""))),
+                        speed=html.escape(str(r.get("speed", ""))),
+                        region=html.escape(str(r.get("region", ""))),
+                    )
+                )
+            results6_html = (
+                "<h3>IPv6 测速结果</h3>"
+                "<p>本次共测出 %d 个可用 IPv6，%s按丢包率、延迟、速度排前 %d 名"
+                "如下；最优 IPv6：<b>%s</b>（延迟 %s ms，丢包率 %s，"
+                "速度 %s MB/s）。</p>"
+                "<div class=\"tbl\"><table><tr><th>IPv6</th><th>丢包率</th>"
+                "<th>平均延迟（ms）</th><th>下载速度（MB/s）</th><th>地区</th></tr>"
+                "%s</table></div>"
+                % (cfg.get("last_result_count6") or len(results6),
+                   region_note6, len(results6),
+                   html.escape(str(best6.get("ip", ""))),
+                   html.escape(str(best6.get("latency", ""))),
+                   html.escape(str(best6.get("loss", ""))),
+                   html.escape(str(best6.get("speed", ""))),
+                   "\n".join(res_rows6))
+            )
+        elif cfg.get("best_ip6"):
+            results6_html = (
+                "<h3>IPv6 测速结果</h3><p>已有最优 IPv6 <b>%s</b>，"
+                "但没有保存测速明细（可能是旧版本跑出的结果）。"
+                "</p>" % html.escape(cfg["best_ip6"]))
+        else:
+            results6_html = (
+                "<h3>IPv6 测速结果</h3><p>IPv6 已开启，尚未测出 IPv6 结果。"
+                "</p>")
     # Subscription management UI was removed from the page on purpose:
     # only a read-only line of the already configured subscription links
     # remains, so the links are still visible. The back end keeps
@@ -1288,13 +2137,29 @@ def settings_page(msg="", edit_binding=False):
         "<div class=\"msg\">%s</div>" % html.escape(msg) if msg else ""
     )
     if dns_configured(cfg):
+        dns_ips = cfg.get("dns_record_ips") or []
+        dns_ips6 = cfg.get("dns_record_ips6") or []
+        aaaa_kv = ""
+        if cfg.get("ipv6_enabled"):
+            aaaa_kv = (
+                "<span class=\"kv\">AAAA 记录：<b>{dns_ip6}</b></span>"
+                "<span class=\"kv\">AAAA 上次更新：{dns_updated6}</span>"
+                "<span class=\"kv\">AAAA 状态：{dns_status6}</span>"
+            ).format(
+                dns_ip6=html.escape(
+                    "、".join(dns_ips6) if dns_ips6 else "—"),
+                dns_updated6=_fmt_time(cfg.get("dns_last_update6")),
+                dns_status6=html.escape(
+                    cfg.get("dns_last_error6") or "已绑定"),
+            )
         binding_html = (
             "<p><span class=\"kv\">当前绑定：<b>{domain}</b>"
             "（Zone：{zone}，记录名：{record}）</span>"
             "<span class=\"kv\">API 令牌：已保存"
             "（页面上永远不显示令牌本身）</span>"
             "<span class=\"kv\">绑定保存时间：{saved}</span>"
-            "<span class=\"kv\">DNS 记录 IP：<b>{dns_ip}</b></span>"
+            "<span class=\"kv\">A 记录（{count} 条）：<b>{dns_ip}</b></span>"
+            "{aaaa_kv}"
             "<span class=\"kv\">DNS 上次更新：{dns_updated}</span>"
             "<span class=\"kv\">DNS 状态：{dns_status}</span></p>"
             .format(
@@ -1302,7 +2167,11 @@ def settings_page(msg="", edit_binding=False):
                 zone=html.escape(cfg.get("cf_zone") or ""),
                 record=html.escape(cfg.get("cf_record") or ""),
                 saved=_fmt_time(cfg.get("cf_binding_saved")),
-                dns_ip=html.escape(cfg.get("dns_record_ip") or "—"),
+                count=_dns_record_count(cfg),
+                dns_ip=html.escape(
+                    "、".join(dns_ips) if dns_ips
+                    else (cfg.get("dns_record_ip") or "—")),
+                aaaa_kv=aaaa_kv,
                 dns_updated=_fmt_time(cfg.get("dns_last_update")),
                 dns_status=html.escape(
                     cfg.get("dns_last_error")
@@ -1345,12 +2214,157 @@ def settings_page(msg="", edit_binding=False):
         ("#log", "最近日志"),
         ("/progress", "测速过程"),
     ])
-    # Account settings live behind the top-right "设置" button: change
-    # the username and/or the password, or log out. The password
-    # itself is never shown; only its hash is stored.
+    # The top-right "设置" panel (three tabs: account, notifications,
+    # online upgrade) is built below, after the notification and
+    # upgrade sections it embeds.
+    mode = _schedule_mode(cfg)
+    schedule_hour, schedule_minute = _schedule_time(cfg)
+    region_options = "".join(
+        '<option value="{code}"{selected}>{label}</option>'.format(
+            code=code, label=html.escape(label),
+            selected=" selected" if code == _region(cfg) else "",
+        )
+        for code, label in REGION_OPTIONS
+    )
+    # DNS record count form (in the binding card): how many top IPs
+    # are written as records for the name (1-5, default 5).
+    dns_count_html = (
+        "<form method=\"post\" action=\"/api/dns/count\">"
+        "<p>DNS 记录数量：<input type=\"number\" name=\"dns_record_count\" "
+        "min=\"1\" max=\"5\" value=\"{count}\"> 条（1–5，默认 5） "
+        "<button type=\"submit\">保存数量</button></p>"
+        "<p class=\"muted\">每次更新把同区域测速排前 N 的 IP 各写一条 A 记录"
+        "（同一域名多条记录，冗余和分流）；IPv6 开启时 AAAA 记录同理。"
+        "更新时先清理该域名下旧的记录再写入新集合，不会越积越多。"
+        "改数量后下次更新生效。</p></form>"
+    ).format(count=_dns_record_count(cfg))
+    # Notification settings (1.0.22): inner content only, no card
+    # wrapper -- it is shown as a tab inside the settings panel.
+    notify_inner = (
+        "<h2>通知设置</h2>"
+        "<form method=\"post\" action=\"/api/notify/save\">"
+        "<p>Telegram 机器人：<label><input type=\"checkbox\" "
+        "name=\"notify_tg_enabled\"{tg_checked}> 启用</label><br>"
+        "Bot Token（留空不改）：<br><input type=\"password\" "
+        "name=\"notify_tg_token\" autocomplete=\"off\" "
+        "placeholder=\"{tg_token_hint}\"></p>"
+        "<p>Chat ID：<br><input type=\"text\" name=\"notify_tg_chat_id\" "
+        "value=\"{tg_chat_id}\"></p>"
+        "<p>飞书机器人：<label><input type=\"checkbox\" "
+        "name=\"notify_fs_enabled\"{fs_checked}> 启用</label><br>"
+        "Webhook 地址（留空不改）：<br><input type=\"password\" "
+        "name=\"notify_fs_webhook\" autocomplete=\"off\" "
+        "placeholder=\"{fs_webhook_hint}\"></p>"
+        "<p>签名密钥（可选，留空不改）：<br><input type=\"password\" "
+        "name=\"notify_fs_secret\" autocomplete=\"off\" "
+        "placeholder=\"{fs_secret_hint}\"></p>"
+        "<p>通知代理（可选，例如 Clash 混合代理 "
+        "http://127.0.0.1:7890）：<br><input type=\"text\" "
+        "name=\"notify_proxy\" value=\"{notify_proxy}\"></p>"
+        "<p class=\"muted\">Telegram 在国内直连通常不通，需要填一个能出海的"
+        "代理；飞书是国内服务，一般直连即可。</p>"
+        "<p>通知事件：<br>"
+        "<label><input type=\"checkbox\" name=\"notify_failure\""
+        "{failure_checked}> 故障通知（测不到 IP / 域名异常 / 断网，"
+        "默认开）</label><br>"
+        "<label><input type=\"checkbox\" name=\"notify_ip_change\""
+        "{ipchange_checked}> 成功换 IP（默认关）</label><br>"
+        "<label><input type=\"checkbox\" name=\"notify_daily_result\""
+        "{daily_checked}> 日常测速结果（默认关）</label></p>"
+        "<p><button class=\"primary\" type=\"submit\">保存通知设置</button>"
+        "</p></form>"
+        "<form method=\"post\" action=\"/api/notify/test\">"
+        "<input type=\"hidden\" name=\"channel\" value=\"telegram\">"
+        "<button type=\"submit\">测试 Telegram</button></form> "
+        "<form method=\"post\" action=\"/api/notify/test\">"
+        "<input type=\"hidden\" name=\"channel\" value=\"feishu\">"
+        "<button type=\"submit\">测试飞书</button></form>"
+        "<p class=\"muted\">故障通知同一故障只发一次（故障消除后下次再发；"
+        "持续超过 24 小时每天补发一次提醒；发送失败每小时最多重试一次）。"
+        "断网时发不出去，恢复后补发并注明断网时段。令牌、密钥只存在本机，"
+        "页面上永远不显示。</p>"
+    ).format(
+        tg_checked=" checked" if cfg.get("notify_tg_enabled") else "",
+        tg_token_hint=(
+            "已保存令牌（留空不改）" if (cfg.get("notify_tg_token") or "")
+            else "尚未保存令牌"),
+        tg_chat_id=html.escape(cfg.get("notify_tg_chat_id") or ""),
+        fs_checked=" checked" if cfg.get("notify_fs_enabled") else "",
+        fs_webhook_hint=(
+            "已保存地址（留空不改）" if (cfg.get("notify_fs_webhook") or "")
+            else "尚未保存地址"),
+        fs_secret_hint=(
+            "已保存密钥（留空不改）" if (cfg.get("notify_fs_secret") or "")
+            else "未设置签名密钥"),
+        notify_proxy=html.escape(cfg.get("notify_proxy") or ""),
+        failure_checked=" checked" if cfg.get("notify_failure", True) else "",
+        ipchange_checked=" checked" if cfg.get("notify_ip_change") else "",
+        daily_checked=" checked" if cfg.get("notify_daily_result") else "",
+    )
+    # Online upgrade (1.0.22): inner content only, no card wrapper --
+    # it is shown as a tab inside the settings panel.
+    upd = cfg.get("update_check") or {}
+    upd_latest = upd.get("latest") or "未检查"
+    upd_changelog = upd.get("changelog") or ""
+    upd_checked = upd.get("checked_at") or "—"
+    upd_downloaded = upd.get("downloaded") or ""
+    changelog_html = (
+        "<p>更新内容：%s</p>" % html.escape(upd_changelog)
+        if upd_changelog else ""
+    )
+    download_form = (
+        "<form method=\"post\" action=\"/api/update/download\">"
+        "<button class=\"primary\" type=\"submit\">下载新版 .fpk</button>"
+        "</form> "
+        if upd.get("available") else ""
+    )
+    downloaded_html = (
+        "<p>已下载到：<br><code>%s</code></p>"
+        % html.escape(upd_downloaded)
+        if upd_downloaded else ""
+    )
+    update_inner = (
+        "<h2>在线升级</h2>"
+        "<p><span class=\"kv\">当前版本：<b>{current}</b></span>"
+        "<span class=\"kv\">仓库最新：<b>{latest}</b></span>"
+        "<span class=\"kv\">上次检查：{checked}</span></p>"
+        "{changelog_html}"
+        "<form method=\"post\" action=\"/api/update/check\">"
+        "<button type=\"submit\">检查更新</button></form> "
+        "{download_form}"
+        "{downloaded_html}"
+        "<p class=\"muted\">检查的是公开仓库 liweisi07/cf-bestip-fpk 里的 "
+        "manifest。下载后去飞牛应用中心 → 手动安装（本地安装），选择下载的 "
+        ".fpk 文件直接覆盖安装，配置会保留；不会自动安装。</p>"
+    ).format(
+        current=VERSION,
+        latest=html.escape(upd_latest),
+        checked=html.escape(upd_checked),
+        changelog_html=changelog_html,
+        download_form=download_form,
+        downloaded_html=downloaded_html,
+    )
+    # Settings live behind the top-right "设置" button, as three tabs:
+    # account/password, notifications and online upgrade. The tab
+    # buttons only hide/show panels in place (SETTINGS_TABS_SCRIPT),
+    # so half-filled forms keep their input; after a refresh the
+    # account tab is shown again. The three panels are the existing
+    # account form, notification settings and online upgrade
+    # sections, moved here unchanged. The password itself is never
+    # shown; only its hash is stored.
     settings_html = (
         "<details class=\"settings\"><summary>⚙ 设置</summary>"
-        "<div class=\"panel\"><h2>账号设置</h2>"
+        "<div class=\"panel\">"
+        "<div class=\"tabs\">"
+        "<button type=\"button\" class=\"tab active\" data-tab=\"account\" "
+        "onclick=\"showSettingsTab('account')\">账号密码设置</button>"
+        "<button type=\"button\" class=\"tab\" data-tab=\"notify\" "
+        "onclick=\"showSettingsTab('notify')\">通知设置</button>"
+        "<button type=\"button\" class=\"tab\" data-tab=\"update\" "
+        "onclick=\"showSettingsTab('update')\">检查更新</button>"
+        "</div>"
+        "<div class=\"tabpane\" id=\"tab-account\">"
+        "<h2>账号设置</h2>"
         "<p>当前账号：<b>{username}</b></p>"
         "<form method=\"post\" action=\"/api/password\">"
         "<p>新账号（留空表示不改）：<br><input type=\"text\" "
@@ -1367,20 +2381,21 @@ def settings_page(msg="", edit_binding=False):
         "<p class=\"muted\">改完后，其它设备/浏览器上的登录会失效，"
         "需要用新账号密码重新登录；当前这个浏览器保持登录。</p>"
         "<form method=\"post\" action=\"/api/logout\">"
-        "<button type=\"submit\">退出登录</button></form></div></details>"
+        "<button type=\"submit\">退出登录</button></form>"
+        "</div>"
+        "<div class=\"tabpane\" id=\"tab-notify\">"
+        "{notify_inner}"
+        "</div>"
+        "<div class=\"tabpane\" id=\"tab-update\">"
+        "{update_inner}"
+        "</div>"
+        "</div></details>"
         .format(
             username=html.escape(get_auth()["username"]),
             minlen=MIN_PASSWORD_LEN,
+            notify_inner=notify_inner,
+            update_inner=update_inner,
         )
-    )
-    mode = _schedule_mode(cfg)
-    schedule_hour, schedule_minute = _schedule_time(cfg)
-    region_options = "".join(
-        '<option value="{code}"{selected}>{label}</option>'.format(
-            code=code, label=html.escape(label),
-            selected=" selected" if code == _region(cfg) else "",
-        )
-        for code, label in REGION_OPTIONS
     )
     return """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -1411,9 +2426,9 @@ def settings_page(msg="", edit_binding=False):
 <form method="post" action="/api/data/clear" onsubmit="return confirm('确定清除测速结果与域名绑定吗？最优 IP、上次测速、测速明细、过程日志与绑定信息都会清空，Cloudflare 上的 DNS 记录本身不动。')"><button type="submit">清除测速结果与绑定</button></form>
 </div>
 <div class="card" id="results"><h2>测速结果</h2>
-{results_html}</div>
+{results_html}{results6_html}</div>
 <div class="card" id="binding"><h2>域名绑定</h2>
-{binding_html}
+{binding_html}{dns_count_html}
 <details{details_open}>
 <summary>编辑绑定</summary>
 <form method="post" action="/api/dns/save">
@@ -1448,9 +2463,12 @@ placeholder="{token_hint}"></p>
 </div>
 <p>优选地区：<select name="region">{region_options}</select></p>
 <p class="muted">只在所选地区里挑最优 IP；该地区没有可用 IP 时用全局最优并记一条日志。选“全部（自动）”就是以前的行为。</p>
+<p><label><input type="checkbox" name="ipv6_enabled"{checked_ipv6}> 启用 IPv6 优选</label></p>
+<p class="muted">开启后每次测速还会测 IPv6（需要本机有 IPv6 出口），把同区域前 N 的 IPv6 各写一条 AAAA 记录；与 IPv4 各自独立优选、各自更新。关掉则只优选 IPv4。</p>
 <p><button class="primary" type="submit">保存</button></p>
 </form></div>
 {toggle_script}
+{settings_tabs_script}
 <div class="card" id="log"><h2>最近日志</h2>
 <pre>{log}</pre>
 <p class="muted">这里只记关键事件（测速完成、DNS 更新、绑定变更等），详细测速过程请看“测速过程”页。</p></div>
@@ -1482,13 +2500,17 @@ placeholder="{token_hint}"></p>
         cf_record=html.escape(cfg.get("cf_record") or ""),
         subs_line=subs_line,
         results_html=results_html,
+        results6_html=results6_html,
         binding_html=binding_html,
+        dns_count_html=dns_count_html,
+        settings_tabs_script=SETTINGS_TABS_SCRIPT,
         details_open=details_open,
         interval_days=interval_days,
         interval_hours=interval_hours,
         interval_minutes=interval_minutes,
         checked_interval=" checked" if mode == "interval" else "",
         checked_daily=" checked" if mode == "daily" else "",
+        checked_ipv6=" checked" if cfg.get("ipv6_enabled") else "",
         schedule_time=_fmt_schedule_time(schedule_hour, schedule_minute),
         region_options=region_options,
         toggle_script=TOGGLE_MODE_SCRIPT,
@@ -1720,6 +2742,7 @@ class Handler(BaseHTTPRequestHandler):
                 started = _job_started
             self._send_text(200, json.dumps({
                 "best_ip": cfg.get("best_ip"),
+                "best_ip6": cfg.get("best_ip6"),
                 "last_run": cfg.get("last_run"),
                 "running": running,
                 "running_stage": stage if running else "",
@@ -1730,11 +2753,17 @@ class Handler(BaseHTTPRequestHandler):
                 "last_log": cfg.get("last_log") or "",
                 "last_results": cfg.get("last_results") or [],
                 "last_result_count": cfg.get("last_result_count") or 0,
+                "last_results6": cfg.get("last_results6") or [],
+                "last_result_count6": cfg.get("last_result_count6") or 0,
                 "domain": full_domain(cfg),
                 "dns_configured": dns_configured(cfg),
                 "dns_record_ip": cfg.get("dns_record_ip"),
+                "dns_record_ips": cfg.get("dns_record_ips") or [],
+                "dns_record_ip6": cfg.get("dns_record_ip6"),
+                "dns_record_ips6": cfg.get("dns_record_ips6") or [],
                 "dns_last_update": cfg.get("dns_last_update"),
                 "dns_last_error": cfg.get("dns_last_error"),
+                "dns_last_error6": cfg.get("dns_last_error6") or "",
                 "subscriptions": [
                     s["name"] for s in cfg["subscriptions"]
                 ],
@@ -1933,7 +2962,9 @@ class Handler(BaseHTTPRequestHandler):
             ok, msg = refresh_cf_ranges()
             load_networks()
             record_event("IP 段：" + msg)
-            self._redirect(msg)
+            ok6, msg6 = refresh_ip6_ranges()
+            record_event("IPv6 段：" + msg6)
+            self._redirect(msg + "\n" + msg6)
             return
         if path == "/api/dns/save":
             # Empty token field means "keep the saved token": the page
@@ -1965,8 +2996,13 @@ class Handler(BaseHTTPRequestHandler):
                     # belongs to the previous record, so clear it until
                     # the new record is verified with an update.
                     _config["dns_record_ip"] = None
+                    _config["dns_record_ips"] = []
                     _config["dns_last_update"] = None
                     _config["dns_last_error"] = ""
+                    _config["dns_record_ip6"] = None
+                    _config["dns_record_ips6"] = []
+                    _config["dns_last_update6"] = None
+                    _config["dns_last_error6"] = ""
             save_config()
             record_event("域名绑定已保存：" + full_domain())
             self._redirect(
@@ -1980,8 +3016,13 @@ class Handler(BaseHTTPRequestHandler):
                 _config["cf_zone"] = ""
                 _config["cf_record"] = ""
                 _config["dns_record_ip"] = None
+                _config["dns_record_ips"] = []
                 _config["dns_last_update"] = None
                 _config["dns_last_error"] = ""
+                _config["dns_record_ip6"] = None
+                _config["dns_record_ips6"] = []
+                _config["dns_last_update6"] = None
+                _config["dns_last_error6"] = ""
                 _config["cf_binding_saved"] = None
             save_config()
             # Regenerate every subscription unmodified so clients stop
@@ -2018,21 +3059,31 @@ class Handler(BaseHTTPRequestHandler):
                     return
             with _config_lock:
                 _config["best_ip"] = None
+                _config["best_ip6"] = None
                 _config["last_run"] = None
                 _config["last_daily_run"] = None
                 _config["last_region"] = None
                 _config["last_region_fallback"] = False
+                _config["last_region6"] = None
+                _config["last_region_fallback6"] = False
                 _config["last_log"] = ""
                 _config["event_log"] = ""
                 _config["last_results"] = []
                 _config["last_result_count"] = 0
+                _config["last_results6"] = []
+                _config["last_result_count6"] = 0
                 _config["cf_token"] = ""
                 _config["cf_zone"] = ""
                 _config["cf_record"] = "cf"
                 _config["cf_binding_saved"] = None
                 _config["dns_record_ip"] = None
+                _config["dns_record_ips"] = []
                 _config["dns_last_update"] = None
                 _config["dns_last_error"] = ""
+                _config["dns_record_ip6"] = None
+                _config["dns_record_ips6"] = []
+                _config["dns_last_update6"] = None
+                _config["dns_last_error6"] = ""
             save_config()
             try:
                 cfg_now = get_config_copy()
@@ -2053,15 +3104,40 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/dns/update":
             cfg = get_config_copy()
-            best_ip = cfg.get("best_ip")
-            if not best_ip:
+            top_ips = _top_ips_for_dns(cfg, "A")
+            if not top_ips:
                 self._redirect(
                     "尚未测速，没有可用的最优 IP：请先点“立即测速并更新”"
                 )
                 return
-            msg = update_dns_now(best_ip)
-            record_event(msg if msg.startswith("DNS") else "DNS：" + msg)
-            self._redirect(msg)
+            msgs = []
+            msg = update_dns_now(top_ips, "A")
+            msgs.append(msg if msg.startswith("DNS") else "DNS：" + msg)
+            record_event(msgs[0])
+            if cfg.get("ipv6_enabled"):
+                top_ips6 = _top_ips_for_dns(cfg, "AAAA")
+                if top_ips6:
+                    msg6 = update_dns_now(top_ips6, "AAAA")
+                    msgs.append(msg6 if msg6.startswith("DNS")
+                                else "DNS（IPv6）：" + msg6)
+                    record_event(msgs[-1])
+            self._redirect("\n".join(msgs))
+            return
+        if path == "/api/dns/count":
+            try:
+                count = int(form.get("dns_record_count") or 0)
+            except ValueError:
+                self._redirect("记录数量无效：请输入 1 到 5")
+                return
+            if not 1 <= count <= 5:
+                self._redirect("记录数量无效：请输入 1 到 5")
+                return
+            with _config_lock:
+                _config["dns_record_count"] = count
+            save_config()
+            record_event("DNS 记录数量改为 %d 条" % count)
+            self._redirect(
+                "DNS 记录数量已保存为 %d 条（下次更新生效）" % count)
             return
         if path == "/api/settings":
             mode = (form.get("schedule_mode") or "").strip().lower()
@@ -2072,6 +3148,7 @@ class Handler(BaseHTTPRequestHandler):
             if region is None:
                 self._redirect("地区无效：请从下拉里选")
                 return
+            ipv6_enabled = bool(form.get("ipv6_enabled"))
             if mode == "daily":
                 sched_time = (form.get("schedule_time") or "").strip()
                 if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$",
@@ -2083,6 +3160,7 @@ class Handler(BaseHTTPRequestHandler):
                     _config["schedule_mode"] = mode
                     _config["schedule_time"] = sched_time
                     _config["region"] = region
+                    _config["ipv6_enabled"] = ipv6_enabled
                 save_config()
                 record_event("测速计划改为每天 %s" % sched_time)
                 self._redirect("测速计划已保存为每天 %s" % sched_time)
@@ -2120,10 +3198,98 @@ class Handler(BaseHTTPRequestHandler):
                 _config["interval_hours"] = hours
                 _config["interval_minutes"] = minutes
                 _config["region"] = region
+                _config["ipv6_enabled"] = ipv6_enabled
             save_config()
             text = _fmt_interval(days, hours, minutes)
             record_event("测速间隔改为 %s" % text)
             self._redirect("测速间隔已保存为 %s" % text)
+            return
+        if path == "/api/notify/save":
+            # Empty secret fields mean "keep the saved value": the
+            # page never shows them, so a blank field cannot mean
+            # clear. Chat ID and proxy are plain values (blank clears).
+            tg_token = (form.get("notify_tg_token") or "").strip()
+            fs_webhook = (form.get("notify_fs_webhook") or "").strip()
+            fs_secret = (form.get("notify_fs_secret") or "").strip()
+            tg_chat_id = (form.get("notify_tg_chat_id") or "").strip()
+            proxy = (form.get("notify_proxy") or "").strip()
+            if fs_webhook and not (
+                    fs_webhook.startswith("http://")
+                    or fs_webhook.startswith("https://")):
+                self._redirect("飞书 Webhook 地址无效：必须是 http(s) 地址")
+                return
+            if proxy and not (
+                    proxy.startswith("http://")
+                    or proxy.startswith("https://")):
+                self._redirect("通知代理无效：必须是 http(s) 地址")
+                return
+            with _config_lock:
+                if tg_token:
+                    _config["notify_tg_token"] = tg_token
+                _config["notify_tg_chat_id"] = tg_chat_id
+                _config["notify_tg_enabled"] = bool(
+                    form.get("notify_tg_enabled"))
+                if fs_webhook:
+                    _config["notify_fs_webhook"] = fs_webhook
+                if fs_secret:
+                    _config["notify_fs_secret"] = fs_secret
+                _config["notify_fs_enabled"] = bool(
+                    form.get("notify_fs_enabled"))
+                _config["notify_proxy"] = proxy
+                _config["notify_failure"] = bool(
+                    form.get("notify_failure"))
+                _config["notify_ip_change"] = bool(
+                    form.get("notify_ip_change"))
+                _config["notify_daily_result"] = bool(
+                    form.get("notify_daily_result"))
+            save_config()
+            self._redirect("通知设置已保存")
+            return
+        if path == "/api/notify/test":
+            channel = (form.get("channel") or "").strip()
+            cfg = get_config_copy()
+            text = _notify_text("测试通知", [
+                "这是一条测试消息，说明通知已接通。",
+            ])
+            proxy = (cfg.get("notify_proxy") or "").strip() or None
+            if channel == "telegram":
+                token = (cfg.get("notify_tg_token") or "").strip()
+                chat_id = (cfg.get("notify_tg_chat_id") or "").strip()
+                if not token or not chat_id:
+                    self._redirect(
+                        "Telegram 未配置：请先填 Bot Token 和 Chat ID")
+                    return
+                ok, err = notify_mod.send_telegram(
+                    token, chat_id, text, timeout=15, proxy=proxy)
+                if ok:
+                    self._redirect("Telegram 测试通知已发送，请查看聊天")
+                else:
+                    self._redirect(
+                        "Telegram 测试发送失败：%s（国内直连通常不通，"
+                        "请在通知设置里填通知代理，如 Clash 混合代理）" % err)
+                return
+            if channel == "feishu":
+                webhook = (cfg.get("notify_fs_webhook") or "").strip()
+                if not webhook:
+                    self._redirect("飞书未配置：请先填 Webhook 地址")
+                    return
+                ok, err = notify_mod.send_feishu(
+                    webhook, cfg.get("notify_fs_secret") or "", text,
+                    timeout=15, proxy=proxy)
+                if ok:
+                    self._redirect("飞书测试通知已发送，请查看群聊")
+                else:
+                    self._redirect("飞书测试发送失败：%s" % err)
+                return
+            self._redirect("测试渠道无效")
+            return
+        if path == "/api/update/check":
+            msg = check_update()
+            self._redirect(msg)
+            return
+        if path == "/api/update/download":
+            msg = download_update()
+            self._redirect(msg)
             return
         self._send_text(404, "不存在的地址")
 

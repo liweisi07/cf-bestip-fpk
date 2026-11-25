@@ -10,8 +10,13 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT INT TERM
 cp -r "$ROOT/app" "$ROOT/cmd" "$ROOT/config" "$ROOT/wizard" "$ROOT/manifest" "$ROOT/ICON.PNG" "$ROOT/ICON_256.PNG" "$ROOT/LICENSE" "$TMP/"
 rm -rf "$TMP/app/__pycache__"
+# Never ship runtime state: app/data/ holds the live config, sessions
+# and last-run result.csv files (test runs can also leave fixture data
+# there). A fresh install must start from clean defaults, so drop it
+# here rather than trusting the source tree to be clean.
+rm -rf "$TMP/app/data"
 cd "$TMP"
 ~/workspace/fnpack build -d .
 mkdir -p "$ROOT/dist"
-cp "$TMP/$APP.fpk" "$ROOT/dist/cf-bestip-domain-$VER-arm64.fpk"
-echo "wrote $ROOT/dist/cf-bestip-domain-$VER-arm64.fpk"
+cp "$TMP/$APP.fpk" "$ROOT/dist/cf-bestip-domain-$VER.fpk"
+echo "wrote $ROOT/dist/cf-bestip-domain-$VER.fpk"

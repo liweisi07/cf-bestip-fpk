@@ -110,6 +110,7 @@ class ServerDomainTest(unittest.TestCase):
             if resolver is None else resolver(domain)
         )
         cfdns.ensure_record_orig = cfdns.ensure_record
+        cfdns.ensure_records_orig = cfdns.ensure_records
 
         def fake_ensure(token, zone, prefix, ip):
             cls.dns_calls.append((token, zone, prefix, ip))
@@ -117,19 +118,35 @@ class ServerDomainTest(unittest.TestCase):
                     "已更新 DNS 记录 %s -> %s（仅 DNS，TTL 60 秒）"
                     % (DOMAIN, ip))
 
+        def fake_ensure_records(token, zone, prefix, ips, record_type="A"):
+            cls.dns_calls.append(
+                (token, zone, prefix, tuple(ips), record_type))
+            ips = list(ips)
+            return (ips, 60,
+                    "已更新 DNS 记录 %s -> %s（共 %d 条 %s 记录，仅 DNS，"
+                    "TTL 60 秒）"
+                    % (DOMAIN, "、".join(ips), len(ips), record_type))
+
         cfdns.ensure_record = fake_ensure
+        cfdns.ensure_records = fake_ensure_records
         app.load_config()
         # Reset shared run state: under `discover` the app module (and
         # its config file) is shared between test files, so a previous
         # test class's run must not leak best_ip/last_run/subscriptions
         # or a domain binding into this class.
         app._config.update({
-            "subscriptions": [], "best_ip": None, "last_run": None,
+            "subscriptions": [], "best_ip": None, "best_ip6": None,
+            "last_run": None,
             "last_log": "", "event_log": "", "last_results": [],
-            "last_result_count": 0, "cf_token": "", "cf_zone": "",
+            "last_result_count": 0, "last_results6": [],
+            "last_result_count6": 0, "cf_token": "", "cf_zone": "",
             "cf_record": "cf", "dns_record_ip": None,
+            "dns_record_ips": [], "dns_record_ip6": None,
+            "dns_record_ips6": [],
             "dns_last_update": None, "dns_last_error": "",
-            "cf_binding_saved": None,
+            "dns_last_update6": None, "dns_last_error6": "",
+            "cf_binding_saved": None, "ipv6_enabled": False,
+            "dns_record_count": 5,
         })
         app.load_networks()
         cls.upstream = ThreadingHTTPServer(("127.0.0.1", 0), _UpstreamHandler)
@@ -168,6 +185,7 @@ class ServerDomainTest(unittest.TestCase):
         cls.upstream.server_close()
         rewriter.resolve_ipv4 = rewriter.resolve_ipv4_orig
         cfdns.ensure_record = cfdns.ensure_record_orig
+        cfdns.ensure_records = cfdns.ensure_records_orig
 
     def _url(self, path):
         return "http://127.0.0.1:%d%s" % (self.app_port, path)
@@ -230,8 +248,10 @@ class ServerDomainTest(unittest.TestCase):
             time.sleep(1)
         self.assertEqual(best, BEST_IP)
         self.assertEqual(info["dns_record_ip"], BEST_IP)
+        self.assertEqual(info["dns_record_ips"], [BEST_IP])
         self.assertEqual(info["dns_last_error"], "")
-        self.assertIn((TOKEN, ZONE, RECORD, BEST_IP), self.dns_calls)
+        self.assertIn((TOKEN, ZONE, RECORD, (BEST_IP,), "A"),
+                      self.dns_calls)
         self.assertNotIn(TOKEN, json.dumps(info))
         # Manual DNS update now succeeds (best IP known).
         status, _ = self._post("/api/dns/update", {})

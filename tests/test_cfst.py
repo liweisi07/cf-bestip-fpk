@@ -75,6 +75,31 @@ class CfstTest(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertIsNone(cfst.pick_best(rows))
 
+    def test_parse_ipv6_result(self):
+        # cfst (v2.1.0+) auto-detects IPv6 from the -f file: the same
+        # result.csv format, with IPv6 addresses in the IP column.
+        # The parser and the ranking must treat them like any IP.
+        csv_text = (
+            "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码\n"
+            "2606:4700:10::6814:1,4,4,0.00,22.0,28.0,LAX\n"
+            "2606:4700:10::6814:2,4,4,0.00,15.0,25.0,SEA\n"
+            "2606:4700:10::6814:3,4,3,25.00,10.0,99.0,HKG\n"
+        )
+        path = _write_tmp(csv_text)
+        try:
+            rows = cfst.parse_result_csv(path)
+        finally:
+            os.remove(path)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(cfst.pick_best(rows),
+                         "2606:4700:10::6814:2")
+        best, fell_back = cfst.pick_best_for_region(rows, "SEA")
+        self.assertEqual(best, "2606:4700:10::6814:2")
+        self.assertFalse(fell_back)
+        top = cfst.top_rows(rows, count=2, region="all")
+        self.assertEqual([r["ip"] for r in top],
+                         ["2606:4700:10::6814:2", "2606:4700:10::6814:1"])
+
 
 if __name__ == "__main__":
     unittest.main()
